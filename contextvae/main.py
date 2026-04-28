@@ -5,9 +5,9 @@ from torch.utils.tensorboard import SummaryWriter
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from context_vae import ContextVAE
-from data import Dataloader
-from utils import ADE_FDE, seed, clustering, get_rng_state, set_rng_state
+from contextvae.model import ContextVAE
+from contextvae.data import Dataloader
+from contextvae.utils import ADE_FDE, seed, clustering, get_rng_state, set_rng_state
 
 import argparse
 parser = argparse.ArgumentParser()

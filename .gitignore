@@ -19,3 +19,8 @@ CLAUDE.md
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+
+# Runs / checkpoints
+runs/
+*.ckpt
+*.pt

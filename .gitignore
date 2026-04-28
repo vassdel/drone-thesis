@@ -1,0 +1,21 @@
+# Datasets
+data/
+levelx/
+scripts/nuscenes-dataset-folder/
+scripts/nuscenes-raw-dataset/
+uniD-dataset-v1.1/
+inD-dataset-v1.1/
+highD-dataset-v1.1/
+rounD-dataset-v1.1/
+
+# Checkpoints
+nuscenes-ckpt/
+lyft-ckpt/
+
+# Project notes
+CLAUDE.md
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/

@@ -290,6 +290,18 @@
 # ==============================================================================
 # 4. ContextVAE / Pipeline Notes  (project-specific)
 # ==============================================================================
+# Implementation: preprocessing/levelx_preprocessing.ipynb (drafted Tue
+# 2026-04-28) realizes the pipeline below. It walks
+# <DATA_ROOT>/<dataset>/data/*_tracks.csv across inD + uniD + rounD with a
+# unified loader, downsamples 25 Hz -> 5 Hz, tags vehicles as VEHICLE/TARGET
+# and VRUs as VRU (kept as context), converts heading deg -> rad, writes
+# local-frame xCenter/yCenter verbatim, and emits ContextVAE on-disk format:
+# train|val/<dataset>_<recId>.txt + .info, and map/<dataset>_<recId>.pkl
+# containing (semantic_map [3,H,W] in [-1,1], H 3x3) where H maps local (x,y)
+# to image (row,col) with the +y-up vs image-y-down flip baked in.
+# 1e9 neighbor padding is left to the loader. highD is intentionally skipped
+# (different schema; see §2).
+#
 # Per Thesis_Plan.docx:
 #
 # - Primary datasets: inD + uniD (~10 GB total). Aerial drone perspective with

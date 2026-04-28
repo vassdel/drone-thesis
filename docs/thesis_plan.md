@@ -156,6 +156,24 @@ e) Environment isolation: ContextVAE references depend on
 WEEK 1 -- April 26 -> May 3
 Theme: lock decisions, set up preprocessing, smoke test.
 
+  PROGRESS LOG (as of Tue Apr 28):
+    - Repo reorganized from flat layout into a package structure:
+      contextvae/ (main.py, context_vae.py, data.py, utils.py),
+      configs/, preprocessing/, docs/, tests/. Commit c47b8f5.
+    - levelXdata preprocessing notebook drafted at
+      preprocessing/levelx_preprocessing.ipynb. Unified loader
+      across inD + uniD + rounD (one schema, switch on
+      locationId / map path). Discovers recordings under
+      <DATA_ROOT>/<dataset>/data/, tallies class labels, emits
+      ContextVAE on-disk format (train|val/*.txt, *.info,
+      map/*.pkl) at 5 Hz with VEHICLE/TARGET vs VRU grouping,
+      heading deg->rad, local-frame xCenter/yCenter verbatim,
+      orthomap normalized to [-1,1] with a 3x3 homography
+      (local (x,y) -> image (row,col), image-y flipped).
+    - GPU/CUDA sanity cell verifies A40 + PyTorch CUDA build.
+    - Still pending in Week 1: smoke-test 1-epoch training on a
+      single recording; draft Ch 1 + Ch 2.
+
   Day 1 (Sun Apr 26)
     - Send hardware-access request in writing. Ask explicitly
       for ETA.
@@ -447,10 +465,12 @@ R7  Personal time loss (illness, etc.).
     and refocus on aerial-orthomap M-ATTN encoder.
 [ ] Confirm with supervisor: submission language; whether June
     15 is firm.
-[ ] Stand up conda env on the A40 machine; verify PyTorch +
-    CUDA work.
-[ ] Build inD/uniD preprocessing pipeline producing valid
-    ContextVAE tensors from one recording.
+[x] Stand up conda env on the A40 machine; verify PyTorch +
+    CUDA work. (Tue Apr 28, sanity cell in
+    preprocessing/levelx_preprocessing.ipynb)
+[x] Build inD/uniD preprocessing pipeline producing valid
+    ContextVAE tensors from one recording. (Tue Apr 28,
+    extended to inD + uniD + rounD via a unified loader.)
 [ ] Smoke-test training on that one recording.
 [ ] Open the LaTeX project; create empty chapter files.
     (Activation energy of starting writing is the largest

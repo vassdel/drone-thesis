@@ -30,9 +30,10 @@ if __name__ == "__main__":
 
     import importlib
     print(os.path.dirname(settings.config))
-    spec = importlib.util.spec_from_file_location("config", settings.config, 
+    spec = importlib.util.spec_from_file_location("config", settings.config,
         submodule_search_locations=[os.path.dirname(settings.config)])
     config = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = config
     spec.loader.exec_module(config)
 
     if settings.device is None:

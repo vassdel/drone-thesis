@@ -12,8 +12,6 @@ This README walks through what's wired up so far: levelXdata preprocessing and t
 - [data/levelx/](data/levelx/) — preprocessed ContextVAE-format tensors (gitignored)
 - [tmp/](tmp/) — local checkpoint/TensorBoard output dir (gitignored)
 
-Full layout description in [CLAUDE.md](CLAUDE.md).
-
 ## Environment
 
 ```bash
@@ -61,7 +59,7 @@ ls data/levelx/map   | wc -l       # 70
 
 The on-disk group tag for vehicles is `VEHICLE/TARGET`. The loader at [contextvae/data.py:543](contextvae/data.py#L543) splits the group field on `/`, so configs must filter by either `["TARGET"]` or `["VEHICLE"]`, **not** the literal `["VEHICLE/TARGET"]` (which matches nothing). The provided configs use `["TARGET"]`.
 
-## Smoke test — Week 1 gate
+## Smoke test (Week 1)
 
 ### Configs
 
@@ -111,17 +109,18 @@ Outputs land at `tmp/levelx_smoke/`:
 - `events.out.tfevents.*` — TensorBoard scalar logs
 - `eval_{ADE,FDE}_{deter,min}/` — per-metric event subdirectories
 
-Inspect loss curves:
+<!-- Inspect loss curves:
 
 ```bash
 tensorboard --logdir tmp/levelx_smoke
-```
+``` -->
 
 ### Pass criteria
 
 - No exceptions, shape errors, or NaNs across the run.
 - Training loss trends downward across the 200 batches (need not be monotonic batch-by-batch; overall trend is what matters).
-- ADE/FDE printed at end of epoch 1 land in the rough range of **2–8 m / 5–15 m** for the untrained model. Numbers in the hundreds-of-meters range usually mean the heading-based ego-rotation in `data.py` mis-fired (check that `.txt` headings are radians, not degrees).
+- ADE/FDE printed at end of epoch 1 land in the rough range of **2–8 m 
+<!-- / 5–15 m** for the untrained model. Numbers in the hundreds-of-meters range usually mean the heading-based ego-rotation in `data.py` mis-fired (check that `.txt` headings are radians, not degrees). -->
 - A trained-model floor for comparison comes later — Week 2 runs the full 100-epoch baseline.
 
 ## Conventions
@@ -131,7 +130,7 @@ tensorboard --logdir tmp/levelx_smoke
 
 ## Pointers
 
-- [docs/thesis_plan.md](docs/thesis_plan.md) — full 7-week thesis schedule, locked decisions, risk register.
+<!-- - [docs/thesis_plan.md](docs/thesis_plan.md) — full 7-week thesis schedule, locked decisions, risk register.
 - [docs/levelx_dataset_formats.md](docs/levelx_dataset_formats.md) — column-by-column reference for every levelXdata file format.
-- [docs/contextvae_training_pipeline.md](docs/contextvae_training_pipeline.md) — model + training pipeline notes.
+- [docs/contextvae_training_pipeline.md](docs/contextvae_training_pipeline.md) — model + training pipeline notes. -->
 - [docs/README_upstream.md](docs/README_upstream.md) — original ContextVAE paper README + nuScenes/Lyft/Waymo reproduction commands.

@@ -44,6 +44,7 @@ class Dataloader(torch.utils.data.Dataset):
         files: List[str], ob_horizon: int, pred_horizon: int,
         batch_size: int, drop_last: bool=False, shuffle: bool=False, batches_per_epoch=None, 
         frameskip: int=1, inclusive_groups: Optional[Sequence]=None,
+        exclude_groups: Optional[Sequence]=None,
         batch_first: bool=False, seed: Optional[int]=None,
         device: Optional[torch.device]=None,
         flip: bool=False, rotate: bool=False, scale: bool=False,
@@ -71,6 +72,7 @@ class Dataloader(torch.utils.data.Dataset):
         self.traj_max_overlap = traj_max_overlap
         self.ob_radius = ob_radius
         self.preload_map = preload_map
+        self.exclude_groups = exclude_groups
 
         if inclusive_groups is None:
             inclusive_groups = [[] for _ in range(len(files))]
@@ -535,6 +537,7 @@ class Dataloader(torch.utils.data.Dataset):
 
     def load_traj(self, file):
         data = {}
+        excl = getattr(self, "exclude_groups", None)
         for row in file.readlines():
             item = row.split()
             if not item: continue
@@ -551,6 +554,8 @@ class Dataloader(torch.utils.data.Dataset):
             else:
                 heading = None
                 group = None
+            if excl and group and any(g in excl for g in group):
+                continue
             if t not in data:
                 data[t] = {}
             data[t][idx] = [x, y, heading, group]

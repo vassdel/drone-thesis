@@ -1,5 +1,3 @@
-# 6-D state's vx, vy are meters per timestep (0.2 s at 5 Hz), NOT m/s.
-# Convert (multiply by 5) before any cross-comparison with the Ntousis LSTM.
 MIN_OB_HORIZON = 10
 OB_HORIZON = 10
 PRED_HORIZON = 25
@@ -14,6 +12,9 @@ preload_data = True
 pred_samples = 5
 clustering = 0
 
+# Vehicle-only ablation: drop VRU rows at load time so they appear in neither
+# ego nor neighbor selection. Fallback if the default baseline's social attention
+# is dominated by the ~37% VRU neighbor share.
 train_dataloader = dict(
     min_ob_horizon=MIN_OB_HORIZON,
     ob_horizon=OB_HORIZON,
@@ -21,6 +22,7 @@ train_dataloader = dict(
     pred_horizon=PRED_HORIZON,
     ob_radius=OB_RADIUS,
     inclusive_groups=["TARGET"],
+    exclude_groups=["VRU"],
     batch_size=128,
     batches_per_epoch=200 # one epoch
 )
@@ -31,6 +33,7 @@ test_dataloader = dict(
     pred_horizon=PRED_HORIZON,
     ob_radius=OB_RADIUS,
     inclusive_groups=["TARGET"],
+    exclude_groups=["VRU"],
     batch_size=512
 )
 

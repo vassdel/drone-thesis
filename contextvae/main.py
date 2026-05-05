@@ -9,6 +9,11 @@ from contextvae.model import ContextVAE
 from contextvae.data import Dataloader
 from contextvae.utils import ADE_FDE, seed, clustering, get_rng_state, set_rng_state
 
+# DataLoader prefetch worker count (Pool 2: torch.utils.data.DataLoader workers,
+# fork-based on Linux, copy-on-write so cheaper than the loader pool).
+# Active only when config.preload_data is True.
+DATALOADER_NUM_WORKERS = 3
+
 import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--train", nargs='+', default=[])
@@ -59,7 +64,7 @@ if __name__ == "__main__":
     #####                                                                    ######
     ###############################################################################
     preload_kwargs = dict(
-        num_workers=6, pin_memory=False, prefetch_factor=2, persistent_workers=True,
+        num_workers=DATALOADER_NUM_WORKERS, pin_memory=False, prefetch_factor=2, persistent_workers=True,
     ) if config.preload_data else dict()
     kwargs = dict(
         batch_first=False,

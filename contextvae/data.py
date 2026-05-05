@@ -8,6 +8,10 @@ import io, pickle
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
 
+# Loader worker pool size cap (Pool 1: ProcessPoolExecutor for trajectory file loading).
+# Each spawn worker costs ~1.5 GB RSS — reduce on memory-tight boxes.
+LOADER_MAX_WORKERS = 2
+
 class Dataloader(torch.utils.data.Dataset):
 
     class FixedNumberBatchSampler(torch.utils.data.sampler.BatchSampler):
@@ -104,7 +108,7 @@ class Dataloader(torch.utils.data.Dataset):
         
         
         done = 0
-        max_workers = min(len(data_files), torch.get_num_threads(), 20)
+        max_workers = min(len(data_files), torch.get_num_threads(), LOADER_MAX_WORKERS)
         with ProcessPoolExecutor(mp_context=multiprocessing.get_context("spawn"), max_workers=max_workers) as p:
             futures = [p.submit(self.__class__.load, self, f, incl_g) for f, incl_g in data_files]
             for fut in as_completed(futures):

@@ -20,7 +20,7 @@ train_dataloader = dict(
     ob_radius=OB_RADIUS,
     inclusive_groups=["TARGET"],
     batch_size=128,
-    batches_per_epoch=200
+    batches_per_epoch=200 # one epoch
 )
 test_dataloader = dict(
     min_ob_horizon=MIN_OB_HORIZON,

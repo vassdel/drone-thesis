@@ -8,9 +8,9 @@ MAP_SIZE = 224
 
 
 lr = 3e-4
-epochs = 100
-test_since = 60
-preload_data = True
+epochs = 60
+test_since = 5
+preload_data = False
 pred_samples = 5
 clustering = 0
 
@@ -21,8 +21,8 @@ train_dataloader = dict(
     pred_horizon=PRED_HORIZON,
     ob_radius=OB_RADIUS,
     inclusive_groups=["TARGET"],
-    batch_size=128,
-    batches_per_epoch=200 # one epoch
+    batch_size=256,
+    batches_per_epoch=1000 # ~25% of the ~1M-trajectory train split per epoch
 )
 test_dataloader = dict(
     min_ob_horizon=MIN_OB_HORIZON,

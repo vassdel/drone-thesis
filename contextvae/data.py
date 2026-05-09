@@ -4,6 +4,10 @@ import os, sys
 import torch
 import numpy as np
 import io, pickle
+# CHANGE (2A): functional color-jitter ops (brightness/contrast/saturation) for
+# training-time map augmentation. Functional API used so we can apply per-sample
+# factors via a small Python loop in collate_fn (see _augment_map below).
+import torchvision.transforms.functional as TF
 
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
@@ -48,6 +52,11 @@ class Dataloader(torch.utils.data.Dataset):
         batch_first: bool=False, seed: Optional[int]=None,
         device: Optional[torch.device]=None,
         flip: bool=False, rotate: bool=False, scale: bool=False,
+        # CHANGE (2A): training-time map-input augmentation flag. Single boolean for
+        # ablation cleanliness — toggles all three transforms (color jitter, rotation
+        # jitter, scale jitter) together. Default False so eval/test datasets remain
+        # deterministic without needing per-config overrides.
+        map_augment: bool=False,
 
         min_ob_horizon: Optional[int]=None, traj_max_overlap: Optional[int]=None,
         ob_radius: Optional[int]=None,
@@ -67,6 +76,11 @@ class Dataloader(torch.utils.data.Dataset):
         self.flip = flip and not self.use_map
         self.rotate = rotate and not self.use_map
         self.scale = scale and not self.use_map
+        # CHANGE (2A): map-augment is the dual of the trajectory-side flip/rotate/scale
+        # block above — those are gated to use_map=False to avoid invalidating map
+        # alignment; this one is gated to use_map=True so it has a map to augment.
+        # The two augmentation paths are mutually exclusive by construction.
+        self.map_augment = map_augment and bool(self.use_map)
 
         self.device = device
         self.traj_max_overlap = traj_max_overlap
@@ -261,15 +275,64 @@ class Dataloader(torch.utils.data.Dataset):
             with torch.no_grad():
                 r = torch.stack(R, 0).to(self.device)
                 m = torch.stack(M, 0).to(self.device)
+                # CHANGE (2A): geometric map augmentation — compose a small per-sample
+                # rotation (uniform ±5°) and isotropic scale jitter (uniform ±10%) INTO
+                # the existing 2x2 heading-rotation block of `r`. Composing into the
+                # same matrix means affine_grid + grid_sample below performs ONE
+                # bilinear sample (not two stacked rotations), avoiding compounded
+                # interpolation aliasing. Scale<1 zooms in (smaller patch extent),
+                # scale>1 zooms out — the model trains against ±10% extent variability
+                # around the canonical 60 m × 60 m crop. self.rng is the seeded
+                # np.random.RandomState shared with the trajectory-side aug block.
+                if self.map_augment:
+                    B = r.size(0)
+                    aug_angles = self.rng.uniform(-5.0, 5.0, size=B) * np.pi / 180.0
+                    aug_scales = 1.0 + self.rng.uniform(-0.1, 0.1, size=B)
+                    cos_a = torch.tensor(np.cos(aug_angles), dtype=torch.float32, device=self.device)
+                    sin_a = torch.tensor(np.sin(aug_angles), dtype=torch.float32, device=self.device)
+                    s_aug = torch.tensor(aug_scales, dtype=torch.float32, device=self.device)
+                    R_aug = torch.zeros(B, 2, 2, dtype=torch.float32, device=self.device)
+                    R_aug[:, 0, 0] =  cos_a * s_aug
+                    R_aug[:, 0, 1] = -sin_a * s_aug
+                    R_aug[:, 1, 0] =  sin_a * s_aug
+                    R_aug[:, 1, 1] =  cos_a * s_aug
+                    r[:, :, :2] = torch.bmm(R_aug, r[:, :, :2])
                 grid = torch.nn.functional.affine_grid(r, m.size(), align_corners=False)
                 m = torch.nn.functional.grid_sample(m, grid, align_corners=False)
                 m = m[..., self.TOP:self.BOTTOM, self.LEFT:self.RIGHT]
+                # CHANGE (2A): color jitter on the rotated, final-cropped tensor.
+                # Applied here (not pre-grid_sample on the 404x404 raw) so it touches
+                # the smaller 224x224 tensor and cannot interact with grid_sample's
+                # edge-padding. Must run BEFORE the unsqueeze_(0) below since the
+                # helper expects [B, 3, H, W].
+                if self.map_augment:
+                    m = self._augment_map(m)
                 m = m.unsqueeze_(0)
             ret.append(m)
         if seq_len is not None:
             seq_len = torch.as_tensor(L, dtype=torch.long, device=self.device)
             ret.append(seq_len)
         return ret
+
+    # CHANGE (2A): per-sample color jitter helper. Brightness/contrast/saturation
+    # factors are drawn independently per agent in the batch from U[0.8, 1.2] —
+    # matching the torchvision ColorJitter convention (factor=1.0 is identity,
+    # ±0.2 is the doc-recommended magnitude). Loop over batch is cheap (B≤256,
+    # GPU ops) and lets us reuse torchvision's well-tested functional API rather
+    # than rolling our own per-channel saturation math. The map raster lives in
+    # [-1, 1] but TF.adjust_* expects [0, 1], so we shift before/after and clamp.
+    def _augment_map(self, m):
+        # m: [B, 3, H, W] in [-1, 1]
+        B = m.size(0)
+        m01 = (m + 1.0) * 0.5  # [-1, 1] -> [0, 1]
+        for i in range(B):
+            bf = float(self.rng.uniform(0.8, 1.2))
+            cf = float(self.rng.uniform(0.8, 1.2))
+            sf = float(self.rng.uniform(0.8, 1.2))
+            m01[i] = TF.adjust_brightness(m01[i], bf)
+            m01[i] = TF.adjust_contrast(m01[i], cf)
+            m01[i] = TF.adjust_saturation(m01[i], sf)
+        return (m01 * 2.0 - 1.0).clamp(-1.0, 1.0)  # [0, 1] -> [-1, 1] + safety clamp
 
     def __len__(self):
         return len(self.data)

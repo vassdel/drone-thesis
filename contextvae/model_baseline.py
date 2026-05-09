@@ -121,19 +121,7 @@ class ContextVAE(torch.nn.Module):
             class MapEncode(torch.nn.Module):
                 def __init__(self):
                     super().__init__()
-                    # CHANGE (1A): load ImageNet-pretrained weights instead of random init.
-                    # The aerial-orthomap variant trains on ~10 GB of inD/uniD/rounD imagery,
-                    # which is too small to train a ResNet from scratch effectively. ImageNet
-                    # weights provide modality-agnostic low-level features (edges, textures,
-                    # shapes) that transfer well to top-down drone imagery despite the
-                    # perspective shift. `weights="DEFAULT"` resolves to the current best
-                    # checkpoint per torchvision (e.g. ResNet18_Weights.IMAGENET1K_V1).
-                    # Caveat: this assumes `map_model` is a torchvision FACTORY function
-                    # (resnet*, mobilenet_v3_*, efficientnet_b*). The `mobile2`/`m2` branch
-                    # imports the MobileNetV2 *class*, which does not accept `weights=` —
-                    # that branch is dead code under current configs/levelx_*.py (which use
-                    # resnet18) but should be fixed if reactivated.
-                    self.backbone = map_model(weights="DEFAULT")
+                    self.backbone = map_model()
                     n_params = 0
                     for m in self.backbone.parameters():
                         n_params += torch.prod(torch.LongTensor(list(m.size()))).item()
@@ -149,38 +137,15 @@ class ContextVAE(torch.nn.Module):
                     elif "eff" in map_model_name:
                         self.feature_dim = self.backbone.classifier[1].in_features
                         self.backbone.classifier = torch.nn.Identity()
-                    # CHANGE (1A): register ImageNet input-normalization stats as buffers.
-                    # The orthomap raster arrives in [-1, 1] (normalized that way during
-                    # preprocessing in process_levelx.ipynb), but ImageNet-pretrained CNNs
-                    # were trained on images in [0, 1] then per-channel (x - mean)/std with
-                    # mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]. Renormalizing
-                    # at the input converges noticeably faster than letting fine-tuning
-                    # drift the learned BN stats. Buffers (not Parameters) ride .cuda()/.to()
-                    # automatically and are saved/loaded with state_dict but are not trained.
-                    self.register_buffer(
-                        "imagenet_mean",
-                        torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
-                    )
-                    self.register_buffer(
-                        "imagenet_std",
-                        torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
-                    )
                 def forward(self, map):
                     if map.dim() > 4:
                         if map.is_contiguous():
                             m = map.view(-1, map.size(-3), map.size(-2), map.size(-1))
                         else:
                             m = torch.reshape(map, (-1, map.size(-3), map.size(-2), map.size(-1)))
-                        # CHANGE (1A): [-1, 1] -> [0, 1] -> ImageNet-normalized.
-                        # Broadcasting: m is (B, 3, H, W), buffers are (1, 3, 1, 1).
-                        m = (m + 1.0) * 0.5
-                        m = (m - self.imagenet_mean) / self.imagenet_std
                         m = self.backbone(m)
                         return m.view(list(map.shape[:-3]) + [self.feature_dim])
-                    # CHANGE (1A): same renormalization on the 4-D path.
-                    m = (map + 1.0) * 0.5
-                    m = (m - self.imagenet_mean) / self.imagenet_std
-                    return self.backbone(m)
+                    return self.backbone(map)
             self.map_encode = MapEncode()
         else:
             self.map_encode = None
@@ -323,21 +288,6 @@ class ContextVAE(torch.nn.Module):
         h = self.rnn_fx_init(dp0)                           # N x Nn x d
 
 
-        # CHANGE (1B): map-input dropout. With probability 0.15 during training, replace
-        # the entire map tensor with zeros before it reaches the encoder. This:
-        #   - regularizes the model against over-reliance on map features (mitigates
-        #     posterior collapse onto the map embedding);
-        #   - jointly trains the with-map and zero-map regimes so a single checkpoint
-        #     degrades gracefully when no map is available at deployment time;
-        #   - smooths the orthomap-vs-no-map ablation (same model, different inputs).
-        # Gated on `self.training` so eval/inference is deterministic, and on `use_map`
-        # so the no-map config (use_map=False / map=None) is untouched. The zero-map
-        # path still runs through the use_map branch below — it does NOT switch to the
-        # else-branch — so the model learns to handle a zeroed map input, not the
-        # absence of the map-encoder pathway entirely.
-        if self.training and use_map and torch.rand(1).item() < 0.15:
-            map = torch.zeros_like(map)
-
         if use_map:
             map0 = self.map_encode(map[0])
             m = self.rnn_fx_init_map(map0)
@@ -372,7 +322,7 @@ class ContextVAE(torch.nn.Module):
         mask_t = mask[L1:L1+L2].unsqueeze(-1)               # L2 x N x Nn x 1
         n_t = n[L1:L1+L2]                                   # L2 x N x Nn x d
         n_t = (mask_t * n_t).sum(-2)                        # L2 x N x d
-        s_t = s[L1:L1+L2]
+        s_t = s[L1:L2+L2]
         x_t = torch.cat((n_t, s_t), -1)
         x_t = torch.flip(x_t, (0,))
         b, _ = self.rnn_by(x_t)                             # L2 x N x n_layer*d

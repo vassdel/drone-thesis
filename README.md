@@ -60,7 +60,7 @@ conda activate new_xupei_env
 
 Python 3.10, PyTorch 1.11 (CUDA-enabled), NumPy 1.21, TensorBoard. This is the only env from which `contextvae/main.py` should be run. Setup details in [docs/xupei_env_notes.md](docs/xupei_env_notes.md).
 
-A separate `waymo` env (TF 2.6, protobuf <3.20) exists solely for `preprocessing/process_waymo.py` and is not used by the levelXdata path.
+<!-- A separate `waymo` env (TF 2.6, protobuf <3.20) exists solely for `preprocessing/process_waymo.py` and is not used by the levelXdata path. -->
 
 ## Preprocessing — levelXdata → ContextVAE tensors
 
@@ -74,7 +74,7 @@ levelx/uniD/data/*_tracks.csv        + ...
 levelx/rounD/data/*_tracks.csv       + ...
 ```
 
-See [docs/levelx_dataset_formats.md](docs/levelx_dataset_formats.md) for the full column reference (and §2 for why highD is excluded).
+<!-- See [docs/levelx_dataset_formats.md](docs/levelx_dataset_formats.md) for the full column reference (and §2 for why highD is excluded). -->
 
 ### Run the notebook
 

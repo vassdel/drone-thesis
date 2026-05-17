@@ -45,5 +45,5 @@ model = dict(
     # Aerial-orthomap variant: ResNet-18 backbone, ImageNet-pretrained weights
     # (loaded via 1A in contextvae/model.py), map-input dropout p=0.15 (1B),
     # and training-time map augmentation (2A, gated by `map_augment` above).
-    map_model = None # "resnet18" OR None 
+    map_model = "resnet18" # "resnet18" OR None 
 )

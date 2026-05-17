@@ -27,76 +27,72 @@ def int_8_lst_to_int(lst):
                 num+=lst[i]*255**i
         return num
 
-class tr_pred_lstm(nn.Module):
-	def __init__(self,out_steps):
-		super().__init__()
-		self.lstm=nn.LSTM(input_size=10,hidden_size=64,batch_first=True)
-		self.linear=nn.Linear(64,out_steps*2) #predict m steps of the trajectory ([x1,y1,..,xm,ym])
-	def forward(self,x):
-		x,_=self.lstm(x)
-		x=self.linear(x)
-		return x
+# ---------------------------------------------------------------------------
+# ContextVAE inference imports.
+# Week 3 Day 1-2 of the thesis schedule replaces the per-target LSTM
+# (`tr_pred_lstm`) trajectory predictor that used to live here with a
+# ContextVAE-based one. The two-module split below keeps the swap clean:
+#   - ContextVAEInferencer wraps the trained model + map raster and runs
+#     one inference per frame on a single target (batch size N=1). It
+#     consumes METRIC world coords and emits future positions in the
+#     same frame.
+#   - PixelMetricShim bridges the server's image pixels (what DeepSORT
+#     produces and the wire protocol returns to the UAV) and the
+#     metric coordinates ContextVAE expects. Day 1-2 backs the shim with
+#     the per-recording homography baked into the map pickle; Day 2-4
+#     swaps that for ORB/AKAZE+RANSAC ego-motion compensation under the
+#     same call signature.
+# Both modules sit alongside this file in `uav_guidance/server_code_only/
+# main_program/` and re-export their respective constants (OB_HORIZON,
+# PROTOCOL_FUTURE_STEPS, EXT_PAD) so the server doesn't need to know the
+# internals.
+# ---------------------------------------------------------------------------
+from contextvae_inference import (
+    ContextVAEInferencer,
+    OB_HORIZON,
+    PROTOCOL_FUTURE_STEPS,
+)
+from pixel_metric_shim import PixelMetricShim
 
-def detect_up(x,y,det_lst):
-	min_dist=100000000
-	min_track=[0,0] #neighbor x,y
-	for v1 in det_lst:
-		xv1=v1[0][0]+0.5*v1[0][2] #x center of potential neighbor
-		yv1=v1[0][1]+0.5*v1[0][3] #y center of potential neighbor
-		if yv1-y<=-xv1+x and yv1-y<=xv1-x and (xv1,yv1)!=(x,y):
-			dist=(yv1-y)**2+(xv1-x)**2
-			if dist<min_dist:
-				min_dist=dist
-				min_track=[xv1,yv1]
-	return min_track
+# ---------------------------------------------------------------------------
+# Server-side ContextVAE configuration.
+# These point at the headline-checkpoint run from Week 2 (M-ATTN orthomap
+# variant trained on inD+uniD+rounD, ADE=0.318 / FDE=0.800 on the val split).
+# Paths are RELATIVE to the repo root that `ContextVAEInferencer` resolves
+# via the sys.path shim at the top of contextvae_inference.py — but
+# the inferencer accepts absolute paths anyway and we pass absolute paths
+# below for clarity. If the operating recording differs from inD_01, the
+# `CONTEXTVAE_MAP_PICKLE` MUST be updated to point at the matching
+# `data/levelx/map/<recording>.pkl`, otherwise the world-frame coordinates
+# returned by the shim will be inconsistent with the homography the
+# inferencer uses to crop the map.
+# ---------------------------------------------------------------------------
+import os as _os
+_REPO_ROOT = _os.path.normpath(
+    _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "..", "..")
+)
+CONTEXTVAE_CKPT = _os.path.join(_REPO_ROOT, "tmp", "levelx_full_map_v1", "ckpt-best")
+CONTEXTVAE_CONFIG = _os.path.join(_REPO_ROOT, "configs", "levelx_train.py")
+# For Day 1-2 replay we hard-code the inD_01 recording. A future revision
+# should make this configurable via a CLI arg / env var so the same server
+# binary can replay against different recordings without code edits.
+CONTEXTVAE_MAP_PICKLE = _os.path.join(_REPO_ROOT, "data", "levelx", "map", "inD_01.pkl")
 
-def detect_down(x,y,det_lst):
-        min_dist=100000000
-        min_track=[0,0]
-        for v1 in det_lst:
-                xv1=v1[0][0]+0.5*v1[0][2] #x center of potential neighbor
-                yv1=v1[0][1]+0.5*v1[0][3] #y center of potential neighbor
-                if yv1-y>=-xv1+x and yv1-y>=xv1-x and (xv1,yv1)!=(x,y):
-                        dist=(yv1-y)**2+(xv1-x)**2
-                        if dist<min_dist:
-                                min_dist=dist
-                                min_track=[xv1,yv1]
-        return min_track
-
-def detect_left(x,y,det_lst):
-        min_dist=100000000
-        min_track=[0,0]
-        for v1 in det_lst:
-                xv1=v1[0][0]+0.5*v1[0][2] #x center of potential neighbor
-                yv1=v1[0][1]+0.5*v1[0][3] #y center of potential neighbor
-                if yv1-y<-xv1+x and yv1-y>xv1-x:
-                        dist=(yv1-y)**2+(xv1-x)**2
-                        if dist<min_dist:
-                                min_dist=dist
-                                min_track=[xv1,yv1]
-        return min_track
-
-def detect_right(x,y,det_lst):
-        min_dist=100000000
-        min_track=[0,0]
-        for v1 in det_lst:
-                xv1=v1[0][0]+0.5*v1[0][2] #x center of potential neighbor
-                yv1=v1[0][1]+0.5*v1[0][3] #y center of potential neighbor
-                if yv1-y>-xv1+x and yv1-y<xv1-x:
-                        dist=(yv1-y)**2+(xv1-x)**2
-                        if dist<min_dist:
-                                min_dist=dist
-                                min_track=[xv1,yv1]
-        return min_track
-
-def scale_data(dt,min,max):
-	if max!=min:
-		return (dt-min)/(max-min)
-	else:
-		return dt-min
-
-def unscale_data(dt,min,max):
-	return (max-min)*dt+min
+# Target sampling cadence in milliseconds. ContextVAE is trained on data
+# downsampled to 5 Hz (200 ms per step) — see configs/levelx_train.py and
+# preprocessing/process_levelx.ipynb. If the server's incoming frame rate
+# differs (the Ntousis baseline is ~15-20 Hz onboard), we throttle history
+# pushes to this cadence so the model receives input at the temporal scale
+# it was trained on. Without this throttle, predictions would still have
+# the right shape but at a wrong temporal scale, breaking the wire-protocol
+# step-timestamps.
+CONTEXTVAE_TARGET_DT_MS = 200
+# Tolerance for jitter around the 200ms cadence. Allows accepting a frame
+# that arrives a bit early (e.g. 195ms after the last push) without
+# dropping it. Empirically chosen — small enough not to bunch pushes at
+# 100ms apart, large enough not to drop frames due to mild scheduling
+# noise on the UAV side.
+CONTEXTVAE_DT_TOLERANCE_MS = 20
 
 def check_pwd(conn):
 	recv_data_tot=b''
@@ -377,13 +373,14 @@ def lin_interp_older_hist(hist,hist_timestamps,avg_timestep):
 		arr_hist_timestamps=np.insert(arr_hist_timestamps,0,-1)
 	return arr
 
-def find_neighbors_from_detections(detections,interest_point_x,interest_point_y):
-	neigh_up=detect_up(interest_point_x,interest_point_y,detections)
-	neigh_down=detect_down(interest_point_x,interest_point_y,detections)
-	neigh_right=detect_right(interest_point_x,interest_point_y,detections)
-	neigh_left=detect_left(interest_point_x,interest_point_y,detections)
-	one_step_data_line=[neigh_up[0],neigh_up[1],neigh_left[0],neigh_left[1],interest_point_x,interest_point_y,neigh_right[0],neigh_right[1],neigh_down[0],neigh_down[1]]
-	return one_step_data_line
+# `find_neighbors_from_detections` (and its 4-direction detect_* helpers)
+# were removed during the Week 3 Day 1-2 ContextVAE swap. The previous
+# implementation packed 4 directional neighbors into a fixed 10-feature
+# vector for the LSTM. ContextVAE uses radius-based neighbor selection
+# instead — per-track DeepSORT histories filtered by `ob_radius=30m` at
+# the target's metric position. That logic lives in
+# ContextVAEInferencer._build_neighbor_tensor and consumes the per-track
+# history dict that we maintain in the main loop below.
 
 while 1:
 	time.sleep(0.5)
@@ -424,14 +421,56 @@ while 1:
 				else:
 					print(addr,"connected")
 				if skip!=1:
-					track_predict_model=tr_pred_lstm(6) #model to predict 6 steps ahead using the last 10 steps
-					track_predict_model.load_state_dict(torch.load('model_epoch_98.pt'))
-					track_predict_model.eval()
-					track_predict_model.to(device)
+					# --- ContextVAE inferencer + pixel-metric shim setup ---
+					# Both are loaded ONCE per connection. The ContextVAE
+					# checkpoint + map raster live on GPU after this; the
+					# shim's H_inv lives on CPU (it's a 3x3 matmul per call,
+					# not worth a GPU round-trip). model_overrides pins
+					# map_model="resnet18" to match the headline checkpoint
+					# regardless of what configs/levelx_train.py currently
+					# has (the user has been toggling map_model for ablations
+					# during Week 2; the toggle should not affect Week 3
+					# deployment).
+					track_predict_model = ContextVAEInferencer(
+						ckpt_path=CONTEXTVAE_CKPT,
+						config_path=CONTEXTVAE_CONFIG,
+						map_pickle_path=CONTEXTVAE_MAP_PICKLE,
+						device=str(device),
+						model_overrides={"map_model": "resnet18"},
+					)
+					pixel_shim = PixelMetricShim(CONTEXTVAE_MAP_PICKLE)
+					print(
+						"[contextvae] loaded ckpt epoch={} ADE={:.4f} FDE={:.4f} (val-split headline)".format(
+							track_predict_model._loaded_epoch,
+							track_predict_model._loaded_ade,
+							track_predict_model._loaded_fde,
+						)
+					)
 
-					tr_pred=[] #track predictions, initially empty
-					interesting_history=[] #track_history of max 10 steps in the form required for trajectory prediction
-					hist_times=[]
+					# --- Per-track rolling history (metric world frame) ---
+					# Dict keyed by DeepSORT track_id -> list of (x_m, y_m)
+					# tuples ordered OLDEST-FIRST, capped at OB_HORIZON
+					# entries. Replaces the old single-target
+					# `interesting_history` buffer of 10-element data lines
+					# (which packed target + 4 directional neighbors per
+					# row). The new structure keeps EVERY confirmed track's
+					# history, so the inferencer can pick neighbors by
+					# radius at inference time without re-doing detection.
+					track_histories_metric = {}
+
+					# Timestamp (in server's millisecond units) of the most
+					# recent frame at which we pushed updates into the
+					# per-track histories. Used to throttle pushes to
+					# CONTEXTVAE_TARGET_DT_MS (=200ms / 5 Hz) so the model
+					# sees data at the same temporal scale as in training.
+					last_inference_timestamp = -10**9
+
+					tr_pred=[] # ContextVAE predictions for the CURRENT target;
+					           # tensor of shape (12,) in PIXEL coords once
+					           # set — wire-protocol compatible with the
+					           # original LSTM output. Empty list means "no
+					           # prediction yet" (e.g. before 10 history
+					           # frames have accumulated).
 					prev_time=0
 					sum_timestep=0 #in ms
 					timestep_cnt=0
@@ -453,9 +492,15 @@ while 1:
 						if(recv_data==b''):
 							break
 						if rec_opt==-1:
-							tr_pred=[] #track predictions, initially empty
-							interesting_history=[] #track_history of max 10 steps in the form required for trajectory prediction
-							hist_times=[]
+							# Target was deselected by the operator. Reset all
+							# trajectory-prediction state to a clean slate so
+							# the next target selection starts from scratch
+							# instead of carrying stale per-track histories
+							# (which could include the previously-tracked
+							# target as a "neighbor" with weird coordinates).
+							tr_pred=[]
+							track_histories_metric = {}
+							last_inference_timestamp = -10**9
 							prev_time=0
 							sum_timestep=0 #in ms
 							timestep_cnt=0
@@ -534,6 +579,94 @@ while 1:
 								total_tracks=0
 								tracks_seen=[]
 								reloc=1
+
+								# --- Per-frame metric snapshot ------------------------
+								# Pre-pass over confirmed tracks: convert each track's
+								# bbox-center pixel coords to METRIC world coords via
+								# the pixel-metric shim. We also note whether the
+								# target was seen with sufficient IoU (>=0.5) to be
+								# trusted — only then do we push histories AND run
+								# inference this frame.
+								#
+								# The metric snapshot is built EVERY frame, but
+								# pushed to the rolling histories only when (a) the
+								# target was seen with good IoU and (b) at least
+								# CONTEXTVAE_TARGET_DT_MS has elapsed since the last
+								# push. That gives the model a temporally-consistent
+								# 5 Hz stream regardless of the server's actual
+								# frame rate.
+								this_frame_metric = {}  # int track_id -> (x_m, y_m)
+								target_seen_this_frame = False
+								target_features_this_frame = None
+								target_iou_this_frame = 0.0
+								target_ltwh_this_frame = None
+								for track in tracks:
+									if rec_opt==-1:
+										break
+									if not track.is_confirmed():
+										continue
+									tid_int = int(track.track_id)
+									ltwh = track.to_ltwh()
+									cx_px = ltwh[0] + 0.5*ltwh[2]
+									cy_px = ltwh[1] + 0.5*ltwh[3]
+									try:
+										x_m, y_m = pixel_shim.pixel_to_metric(cx_px, cy_px)
+									except Exception as e:
+										# Shim can fail if the homography
+										# inverse produces w==0 — typically
+										# means we got a bbox center far
+										# outside the recording's content
+										# bbox. Skip this track for this
+										# frame; the next frame may recover.
+										print("[contextvae] pixel_to_metric failed for track", tid_int, ":", e)
+										continue
+									this_frame_metric[tid_int] = (x_m, y_m)
+									# Target-specific IoU check, replacing the
+									# version that used to live further down
+									# inside the per-track block.
+									if tid_int == interesting_track_id:
+										target_features_this_frame, target_iou_this_frame = get_feats_of_iou_closest(
+											current_detection_features,
+											cx_px, cy_px, ltwh[2], ltwh[3]
+										)
+										target_seen_this_frame = (target_iou_this_frame >= 0.5)
+										target_ltwh_this_frame = ltwh
+
+								# --- Throttled history push ---------------------------
+								# We push ALL confirmed tracks (target + neighbors)
+								# to their rolling histories ONLY when:
+								#   - the target was seen this frame with good IoU
+								#     (so we know the timeline anchor is reliable);
+								#   - and the cadence gate has elapsed.
+								# Synchronizing pushes across tracks keeps neighbor
+								# rows aligned with target rows, which is what
+								# ContextVAE's training-time loader assumes
+								# (data.py:417 iterates over the same `range(...)`
+								# for all agents).
+								if rec_opt != -1 and target_seen_this_frame and (
+									timestamp - last_inference_timestamp
+									>= CONTEXTVAE_TARGET_DT_MS - CONTEXTVAE_DT_TOLERANCE_MS
+								):
+									for tid_int, (x_m, y_m) in this_frame_metric.items():
+										hist = track_histories_metric.setdefault(tid_int, [])
+										hist.append((x_m, y_m))
+										# FIFO eviction. Cap at OB_HORIZON
+										# because that's all the inferencer
+										# needs; storing more would just
+										# burn memory.
+										if len(hist) > OB_HORIZON:
+											del hist[: len(hist) - OB_HORIZON]
+									# Evict tracks that did NOT appear this
+									# frame. The training-time loader uses a
+									# strict "present at every obs frame"
+									# rule for neighbors (data.py:418-431);
+									# we mirror it by dropping any track
+									# that misses an inference tick.
+									for stale_tid in list(track_histories_metric.keys()):
+										if stale_tid not in this_frame_metric:
+											del track_histories_metric[stale_tid]
+									last_inference_timestamp = timestamp
+
 								for track in tracks:
 									if rec_opt==-1:
 										break
@@ -559,39 +692,81 @@ while 1:
 										track_ltwh=track.to_ltwh()
 										target_x=track_ltwh[0]+0.5*track_ltwh[2]
 										target_y=track_ltwh[1]+0.5*track_ltwh[3]
-										#print(type(track_ltwh))
+										# Use t_i_lstm / t_f_lstm names unchanged so
+										# the existing latency-printing line at the
+										# end of the frame block continues to work
+										# (the variable name is misleading post-swap
+										# — it's now "inference time" generally —
+										# but renaming would dirty the diff).
 										t_i_lstm=time.time_ns()//1000000
 										last_w=track_ltwh[2]
 										last_h=track_ltwh[3]
-										last_target_features_tmp,match_iou=get_feats_of_iou_closest(current_detection_features,track_ltwh[0]+0.5*track_ltwh[2],track_ltwh[1]+0.5*track_ltwh[3],track_ltwh[2],track_ltwh[3])
+										# match_iou + last_target_features handling
+										# moved to the pre-pass above (target_iou_this_frame
+										# already holds the value). Refresh the cached
+										# tracking features only when the IoU is good
+										# enough, matching the original behavior.
+										match_iou = target_iou_this_frame
 										if match_iou>=0.5:
 											last_seen=timestamp
-											last_target_features=last_target_features_tmp
-											data_line=find_neighbors_from_detections(results,track_ltwh[0]+0.5*track_ltwh[2],track_ltwh[1]+0.5*track_ltwh[3])
+											last_target_features=target_features_this_frame
 
-										#	for i in range(len(data_line)): # Add offset for the predictions and the return values
-										#		if i%2==0:
-										#			data_line[i]+=x_left
-										#		else:
-										#			data_line[i]+=y_top
-
-											interesting_history.append(data_line)
-											hist_times.append(timestamp) #timestamps used to handle uneven detections
-											if len(interesting_history)>10:
-												interesting_history=interesting_history[1:]
-												hist_times=hist_times[1:]
-											if len(interesting_history)>1:
-												intr_hist_arr=lin_interp_older_hist(interesting_history,hist_times,sum_timestep/timestep_cnt)
-												max_h=intr_hist_arr.max()
-												min_h=intr_hist_arr.min()
-												hist_scaled=scale_data(intr_hist_arr,min_h,max_h)
-												tr_pred=track_predict_model(torch.Tensor(hist_scaled).to(device))[-1,:]
-												tr_pred=unscale_data(tr_pred,min_h,max_h)
-												print("Predicted future track([x1,y1,..,x6,y6]):",[round(n,1) for n in tr_pred.tolist()])
+											# --- ContextVAE inference --------------------------
+											# Build the target's history in oldest->newest
+											# order. The history was pushed in this same
+											# order by the throttled push block above.
+											# Inference is gated on having a FULL window
+											# (OB_HORIZON entries); we don't run on a
+											# half-filled buffer, since ContextVAE was
+											# trained on 10 obs frames and cold-starting
+											# with fewer would give degraded results.
+											target_hist = track_histories_metric.get(interesting_track_id, [])
+											if len(target_hist) >= OB_HORIZON:
+												target_xy = np.array(target_hist[-OB_HORIZON:], dtype=np.float64)  # (10, 2)
+												# Build the per-track-id neighbor dict.
+												# Only include neighbors whose history is
+												# ALSO full (the inferencer's radius filter
+												# operates on (10, 2) arrays). Tracks with
+												# shorter histories simply skip this frame
+												# and get included on a later one.
+												neighbor_xy_metric = {}
+												for nb_tid, nb_hist in track_histories_metric.items():
+													if nb_tid == interesting_track_id:
+														continue
+													if len(nb_hist) >= OB_HORIZON:
+														neighbor_xy_metric[nb_tid] = np.array(
+															nb_hist[-OB_HORIZON:], dtype=np.float64
+														)
+												# Run the K=5-sample ContextVAE forward.
+												# Returns (PROTOCOL_FUTURE_STEPS, 2) = (6, 2)
+												# in METRIC world coords.
+												future_xy_metric = track_predict_model.infer(
+													target_xy, neighbor_xy_metric
+												)
+												# Convert each future step back to pixel
+												# coords via the same shim used on the
+												# inputs. The wire protocol downstream
+												# (and the relocate_target helper at the
+												# top of this file) reads tr_pred as a
+												# FLAT 12-vector of pixel coords
+												# [x1, y1, x2, y2, ..., x6, y6].
+												future_uv = pixel_shim.metrics_to_pixel(future_xy_metric)  # (6, 2)
+												tr_pred = torch.tensor(
+													future_uv.flatten().astype(np.float32),
+													device=device,
+												)
+												print("Predicted future track([x1,y1,..,x6,y6]):",
+													[round(n,1) for n in tr_pred.tolist()])
+												# Visualize: draw a small red dot at
+												# each predicted future position. Matches
+												# the original LSTM viz at this point.
 												for i in range(tr_pred.shape[0]//2):
-									#				img_r=cv2.circle(img_r, (round(tr_pred[2*i].item()-x_left),round(tr_pred[2*i+1].item()-y_top)), radius=2, color=(0, 0, 255), thickness=-1)
-													img_r=cv2.circle(img_r, (round(tr_pred[2*i].item()),round(tr_pred[2*i+1].item())), radius=2, color=(0, 0, 255), thickness=-1)
-											t_f_lstm=time.time_ns()//1000000
+													img_r=cv2.circle(
+														img_r,
+														(round(tr_pred[2*i].item()),round(tr_pred[2*i+1].item())),
+														radius=2, color=(0, 0, 255), thickness=-1
+													)
+										t_f_lstm=time.time_ns()//1000000
 									ltrb = track.to_ltrb()
 									#print(track_id,":",ltrb)
 									if int(track_id)!=interesting_track_id:
@@ -626,9 +801,14 @@ while 1:
 										seen_n_frames_ago=int((timestamp-last_seen)/(sum_timestep/timestep_cnt)) #how many avg timesteps have passed since last seen
 										skip_reloc=0
 										if seen_n_frames_ago>30:
-											tr_pred=[] #track predictions, initially empty
-											interesting_history=[] #track_history of max 10 steps in the form required for trajectory prediction
-											hist_times=[]
+											# Target lost for >30 frames — give up
+											# on the current prediction state and
+											# start fresh. Clear per-track metric
+											# histories so a re-selected target
+											# doesn't inherit stale neighbor entries.
+											tr_pred=[]
+											track_histories_metric = {}
+											last_inference_timestamp = -10**9
 											prev_time=0
 											sum_timestep=0 #in ms
 											timestep_cnt=0

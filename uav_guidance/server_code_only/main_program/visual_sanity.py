@@ -94,9 +94,12 @@ def main() -> None:
 
     print(f"[viz] reading val: {val_txt}")
     rows = _read_txt(val_txt)
-    target_aid, frame_ids, target_xys_full, frames_to_rows = _find_target_window(rows)
+    target_aid, frame_ids, target_xys_full, target_heading_world, frames_to_rows = (
+        _find_target_window(rows)
+    )
     print(f"[viz] target_aid : {target_aid}")
     print(f"[viz] frame range: {frame_ids[0]}..{frame_ids[-1]}")
+    print(f"[viz] heading_w  : {target_heading_world:.4f} rad")
     target_history = target_xys_full[:OB_HORIZON]              # (10, 2)
     target_future_gt = target_xys_full[OB_HORIZON:]            # (25, 2)
 
@@ -114,8 +117,15 @@ def main() -> None:
     )
     shim = PixelMetricShim(map_pickle)
 
-    # Inference
-    pred_metric = inf.infer(target_history, neighbors)  # (6, 2) metric world
+    # Inference. Pass the stored heading (radians, world frame) at the first
+    # obs frame — same value the training-time loader reads from
+    # contextvae/data.py:468. Without this the inferencer falls back to an
+    # atan2 finite-diff of (target[1]-target[0]) and emits a one-shot warning;
+    # the visual would then show a map crop rotated by velocity direction
+    # instead of vehicle heading, biasing the prediction overlay.
+    pred_metric = inf.infer(
+        target_history, neighbors, heading_world=target_heading_world,
+    )  # (6, 2) metric world
     print(f"[viz] pred metric:\n{pred_metric}")
 
     # Project everything to pixel coords for drawing.

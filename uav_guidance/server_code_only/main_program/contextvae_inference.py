@@ -70,6 +70,10 @@ Public API
     future_xy = inferencer.infer(
         target_history_metric=(10, 2) np.ndarray of (x, y) in metric world coords,
         neighbor_histories_metric={track_id: (10, 2) np.ndarray, ...},
+        heading_world=0.0,  # radians, world frame; matches training data.py:468.
+                            # If omitted, falls back to atan2 of target[1]-target[0]
+                            # AND emits a one-shot RuntimeWarning to surface the
+                            # degradation — see infer() docstring.
     )  # returns (PROTOCOL_FUTURE_STEPS, 2) np.ndarray, mean over K samples,
        # in METRIC WORLD coords (same frame as inputs).
 
@@ -82,6 +86,7 @@ import os
 import sys
 import math
 import pickle
+import warnings
 import importlib.util
 from typing import Dict, Optional
 
@@ -220,6 +225,16 @@ class ContextVAEInferencer:
         self.device = torch.device(device)
         self.k_samples = int(k_samples)
 
+        # One-shot warning latch for the heading-fallback path in `infer()`.
+        # When a caller invokes `infer(...)` WITHOUT supplying `heading_world`,
+        # we approximate heading via finite-difference (atan2) over the first
+        # two obs positions. For stationary/slow agents this collapses to 0
+        # and the M-ATTN encoder receives an un-rotated map crop it never
+        # saw during training — a silent degradation. We warn the first time
+        # this happens per instance so the caller is on notice; subsequent
+        # calls in the degraded mode stay quiet to avoid log spam.
+        self._heading_fallback_warned = False
+
         # --- Load the config file -------------------------------------------
         # The training-side configs are plain Python files (not YAML/JSON).
         # We load them with importlib so we can read `config.model` (the
@@ -312,6 +327,7 @@ class ContextVAEInferencer:
         self,
         target_history_metric: np.ndarray,
         neighbor_histories_metric: Dict[int, np.ndarray],
+        heading_world: Optional[float] = None,
     ) -> np.ndarray:
         """
         Run one inference step and return the next `PROTOCOL_FUTURE_STEPS`
@@ -326,6 +342,19 @@ class ContextVAEInferencer:
             Mapping from DeepSORT track_id -> (OB_HORIZON, 2) array of the
             same form. The target track_id should NOT be in this dict.
             Empty dict is allowed (means no neighbors visible).
+        heading_world : Optional[float], default None
+            Target heading at the FIRST obs frame, in RADIANS, world frame
+            (i.e. atan2-convention angle from +x). When provided, this is
+            used VERBATIM for the localization rotation and map crop, exactly
+            matching the training-time loader (which reads `heading` from the
+            preprocessed .txt — see contextvae/data.py:468). When None, we
+            fall back to a finite-difference approximation `atan2(v0_y, v0_x)`
+            over the first two obs positions and emit a one-shot warning;
+            for stationary/slow agents this fallback collapses to 0 and the
+            M-ATTN encoder receives an un-rotated crop it never saw in
+            training. Callers with access to a real heading (e.g. via the
+            preprocessed .txt heading column, or DeepSORT bbox displacement
+            over a longer history) SHOULD pass it here.
 
         Returns
         -------
@@ -349,19 +378,44 @@ class ContextVAEInferencer:
         # ContextVAE's training-time localization uses the heading at the
         # FIRST obs frame (see contextvae/data.py:468 — `heading` is read
         # from the agent's data at `first_frame[idx][1]` which corresponds
-        # to tid_start). We mirror that at inference time. Since DeepSORT
-        # doesn't expose heading, we approximate it via finite difference
-        # between the first two observation frames.
+        # to tid_start). We mirror that at inference time.
         #
-        # Edge case: if the agent was stationary at frames 0-1, the velocity
-        # vector is zero and atan2 returns 0 (atan2(0, 0) == 0 by IEEE 754
-        # / Python convention). We accept that: 0-heading on a stationary
-        # agent doesn't matter much because the rotation has nothing to
-        # rotate (the trajectory is a single point). The model's prediction
-        # will still be valid; only the map crop will be axis-aligned with
-        # the world frame instead of the agent frame.
-        v0 = target_history_metric[1] - target_history_metric[0]
-        heading = math.atan2(v0[1], v0[0])  # radians, world frame
+        # Preferred path: the caller supplies `heading_world` (radians, world
+        # frame) directly — typically pulled from the same source training
+        # used (the preprocessed .txt heading column, or a robust DeepSORT-
+        # bbox-displacement estimate over a window > 1 step). When supplied,
+        # we use it verbatim, eliminating the train/infer drift documented
+        # by the heading-source audit.
+        #
+        # Fallback path: when `heading_world` is None we approximate heading
+        # via first-order finite difference `atan2(v0_y, v0_x)` over the
+        # first two obs positions. For stationary/slow agents the velocity
+        # vector is ~zero and atan2 returns 0 (atan2(0, 0) == 0 by IEEE 754
+        # / Python convention). The map crop is then axis-aligned with the
+        # WORLD frame rather than the AGENT frame — a distribution the
+        # M-ATTN encoder never saw at training time, degrading predictions.
+        # We emit a one-shot warning per inferencer instance so the caller
+        # is on notice; subsequent fallback calls stay quiet to avoid spam.
+        if heading_world is not None:
+            heading = float(heading_world)
+        else:
+            if not self._heading_fallback_warned:
+                warnings.warn(
+                    "ContextVAEInferencer.infer() called without "
+                    "`heading_world`; falling back to atan2(v0_y, v0_x) over "
+                    "the first two obs positions. This DIVERGES from the "
+                    "training-time loader (which reads the stored heading) "
+                    "and degrades for stationary/slow agents (atan2 collapses "
+                    "to 0, producing un-rotated map crops the M-ATTN encoder "
+                    "never saw). Pass `heading_world` (radians, world frame) "
+                    "to silence this warning. (Warning emitted once per "
+                    "ContextVAEInferencer instance.)",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._heading_fallback_warned = True
+            v0 = target_history_metric[1] - target_history_metric[0]
+            heading = math.atan2(v0[1], v0[0])  # radians, world frame
 
         # The rotation angle stored in `__getitem__` is `-heading` (see
         # data.py:495). We carry the same sign here so the rotation logic
@@ -807,7 +861,9 @@ def _smoke_test() -> None:
         102: target_hist + np.array([0.0, -3.0])[None, :],  # -3 m in y
     }
 
-    out = inf.infer(target_hist, neighbors)
+    # Pass a synthetic heading (0 rad = +x) so the smoke test exercises the
+    # heading-aware code path and does NOT trip the one-shot fallback warning.
+    out = inf.infer(target_hist, neighbors, heading_world=0.0)
     print(f"[smoke] output shape   : {out.shape}")
     print(f"[smoke] output[:3]     :\n{out[:3]}")
     assert out.shape == (PROTOCOL_FUTURE_STEPS, 2), f"unexpected shape {out.shape}"

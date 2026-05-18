@@ -11,10 +11,13 @@ a UAV video stream.
 This module bridges the two. For **Week 3 Day 1-2** (model swap; replay on
 a STATIONARY drone clip derived from an inD/uniD recording), the bridge
 is the homography `H` stored in the map pickle from
-`preprocessing/process_levelx.ipynb`. For **Week 3 Day 2-4**, this shim is
-replaced by an ego-motion-compensated homography pipeline (ORB/AKAZE +
-RANSAC) that handles moving-UAV footage. The signature defined here is
-the contract Day 2-4 must preserve.
+`preprocessing/process_levelx.ipynb`. The Day 2-4 moving-camera variant
+lives in `ego_motion_shim.MovingCameraShim` — same four-method API plus
+one new `update_frame(frame_bgr, mask_bboxes_ltwh)` lifecycle call. The
+server file picks between the two via the `EGO_MOTION_ENABLED` flag near
+the top of `scene_recog_socket_yolov8.py`. `PixelMetricShim` remains the
+stationary-drone reference / fallback and is composed internally by
+`MovingCameraShim` to handle the static K0 -> world step.
 
 Coordinate frames involved
 --------------------------

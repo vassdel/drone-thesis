@@ -55,6 +55,20 @@ from contextvae_inference import (
 from pixel_metric_shim import PixelMetricShim
 
 # ---------------------------------------------------------------------------
+# Week 3 Day 2-4: opt-in ego-motion compensation for moving-UAV footage.
+# When EGO_MOTION_ENABLED is True, `pixel_shim` is built as a
+# `MovingCameraShim` (same four-method API as PixelMetricShim plus a new
+# `update_frame(frame_bgr, mask_bboxes_ltwh)` lifecycle call invoked once
+# per frame after YOLO detection). When False, behavior is bit-for-bit
+# identical to the Day 1-2 stationary-drone code path. See
+# uav_guidance/server_code_only/main_program/ego_motion_shim.py and the
+# accompanying tests/test_ego_motion_shim.py validation harness.
+# ---------------------------------------------------------------------------
+EGO_MOTION_ENABLED = False
+if EGO_MOTION_ENABLED:
+    from ego_motion_shim import MovingCameraShim
+
+# ---------------------------------------------------------------------------
 # Server-side ContextVAE configuration.
 # These point at the headline-checkpoint run from Week 2 (M-ATTN orthomap
 # variant trained on inD+uniD+rounD, ADE=0.318 / FDE=0.800 on the val split).
@@ -438,7 +452,11 @@ while 1:
 						device=str(device),
 						model_overrides={"map_model": "resnet18"},
 					)
-					pixel_shim = PixelMetricShim(CONTEXTVAE_MAP_PICKLE)
+					if EGO_MOTION_ENABLED:
+						pixel_shim = MovingCameraShim(CONTEXTVAE_MAP_PICKLE)
+						print("[ego-motion] enabled — pixel_shim is MovingCameraShim")
+					else:
+						pixel_shim = PixelMetricShim(CONTEXTVAE_MAP_PICKLE)
 					print(
 						"[contextvae] loaded ckpt epoch={} ADE={:.4f} FDE={:.4f} (val-split headline)".format(
 							track_predict_model._loaded_epoch,
@@ -545,6 +563,14 @@ while 1:
 									sum_timestep+=timestamp-prev_time
 								prev_time=timestamp
 								recv_data_tot=cv2.imdecode(recv_data_tot, cv2.IMREAD_COLOR)
+								if recv_data_tot is None:
+									# Malformed JPEG payload — cv2.imdecode silently
+									# returns None instead of raising. Skipping prevents
+									# the subsequent .shape access from raising an
+									# AttributeError that would propagate to the outer
+									# handler and kill the select thread (audit bug #7).
+									print("[server] skipped frame: cv2.imdecode returned None")
+									continue
 								print("+++Received frame",4*frame_id,"with shape",recv_data_tot.shape,"and timestamp",timestamp)
 
 								if scaling_factor!=1: # If no target is selected, the image is transmitted whole and resized. It needs to be reshaped back to original shape.
@@ -557,6 +583,32 @@ while 1:
 								results,current_detection_features=get_boxes_feats_yolov8(recv_data_tot,model)
 								t_f_detr=time.time_ns()//1000000
 								img_r=recv_data_tot.copy()
+
+								# Ego-motion compensation hook (Week 3 Day 2-4).
+								# `MovingCameraShim.update_frame` re-estimates H_live->K0
+								# per frame using ORB + USAC_MAGSAC against the canonical
+								# keyframe pulled from the orthomap pickle. The YOLO bbox
+								# list is masked out so dynamic agents don't poison the fit.
+								# All four pixel<->metric calls below transparently respect
+								# the just-updated H. No-op when EGO_MOTION_ENABLED=False.
+								if EGO_MOTION_ENABLED:
+									ego_status = pixel_shim.update_frame(
+										recv_data_tot,
+										mask_bboxes_ltwh=[ltwh for (ltwh, _conf, _cls) in results],
+									)
+									if ego_status != "OK":
+										print(f"[ego-motion] frame {frame_id}: {ego_status}")
+									# Audit bug #6: when update_frame returns FROZEN
+									# the shim is reusing the previous frame's H. Any
+									# pixel_to_metric() call below would record stale
+									# "metric history" for this frame, silently
+									# corrupting the rolling buffer after a few FROZEN
+									# frames in a row. Skip the throttled-push block
+									# and inference for this frame. REANCHORED is
+									# safe — H was just refreshed against a new
+									# keyframe — so only FROZEN triggers the skip.
+									if ego_status == "FROZEN":
+										continue
 			#					print("++++++++++++++++++++++++++")
 			#					print(results)
 			#					print("++++++++++++++++++++++++++")

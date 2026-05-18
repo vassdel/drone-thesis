@@ -127,22 +127,33 @@ def _find_target_window(rows, ob_h=OB_HORIZON, pred_h=PRED_HORIZON):
 
     Returns
     -------
-    (target_aid, frame_ids, target_positions_full, frames_to_rows)
+    (target_aid, frame_ids, target_positions_full, target_heading_world,
+     frames_to_rows)
         target_aid               : int, chosen target agent id
         frame_ids                : list of (ob_h+pred_h) consecutive fids
         target_positions_full    : (ob_h+pred_h, 2) ndarray, target's (x, y)
+        target_heading_world     : float, heading (radians, world frame) at
+                                   the FIRST obs frame of the window — the
+                                   value stored in column 5 of the .txt and
+                                   used by the training loader (data.py:468)
         frames_to_rows           : Dict[fid -> list of (aid, x, y, group)]
                                    used to fetch neighbors per frame
     """
-    # Index: per-agent list of (fid, x, y, group) sorted by fid.
+    # Index: per-agent list of (fid, x, y, heading, group) sorted by fid.
+    # We MUST keep the heading per-row so we can return the value at the
+    # first obs frame for the chosen target — the training-time loader
+    # reads this exact value (contextvae/data.py:468), and the
+    # ContextVAEInferencer needs it via the new `heading_world` arg to
+    # match training-time behavior.
     per_agent: dict = {}
-    for fid, aid, x, y, _heading, group in rows:
-        per_agent.setdefault(aid, []).append((fid, x, y, group))
+    for fid, aid, x, y, heading, group in rows:
+        per_agent.setdefault(aid, []).append((fid, x, y, heading, group))
     for aid in per_agent:
         per_agent[aid].sort(key=lambda r: r[0])
 
     # Frame -> [(aid, x, y, group), ...]. We'll need this to look up neighbors
-    # at any frame id.
+    # at any frame id. Heading is not needed for neighbors (the inferencer
+    # only uses the target's heading for localization/map rotation).
     frames_to_rows: dict = {}
     for fid, aid, x, y, _h, group in rows:
         frames_to_rows.setdefault(fid, []).append((aid, x, y, group))
@@ -169,16 +180,20 @@ def _find_target_window(rows, ob_h=OB_HORIZON, pred_h=PRED_HORIZON):
         # All rows in the ego window must carry the TARGET tag — otherwise
         # the agent transitions classes mid-window, which is rare and
         # disqualifying.
-        if not all(_has_target_tag(g) for (_f, _x, _y, g) in window):
+        if not all(_has_target_tag(g) for (_f, _x, _y, _h, g) in window):
             continue
         # Uniform fid step across the window.
         fids = [r[0] for r in window]
         diffs = np.diff(fids)
         if len(diffs) == 0 or not (diffs == diffs[0]).all():
             continue
-        # Found a clean window. Pack it.
+        # Found a clean window. Pack it. The heading at the FIRST obs frame
+        # is what the training loader uses for localization (data.py:468 —
+        # heading is captured at the first observation step of the window),
+        # so we hand back exactly that scalar.
         xys = np.array([(r[1], r[2]) for r in window], dtype=np.float64)
-        return aid, fids, xys, frames_to_rows
+        heading_world = float(window[0][3])  # already in radians per preprocessing
+        return aid, fids, xys, heading_world, frames_to_rows
 
     raise RuntimeError(
         f"No TARGET agent found with a clean (ob_h={ob_h} + pred_h={pred_h}) window."
@@ -240,7 +255,9 @@ def main():
     rows = _read_txt(val_txt)
     print(f"[verify]   {len(rows)} rows")
 
-    target_aid, frame_ids, target_xys_full, frames_to_rows = _find_target_window(rows)
+    target_aid, frame_ids, target_xys_full, target_heading_world, frames_to_rows = (
+        _find_target_window(rows)
+    )
     print(f"[verify] picked target_aid={target_aid}")
     print(f"[verify] window fids: {frame_ids[0]}..{frame_ids[-1]} ({len(frame_ids)} frames)")
     target_history = target_xys_full[:OB_HORIZON]
@@ -248,6 +265,10 @@ def main():
     print(f"[verify] target history start: {target_history[0]}")
     print(f"[verify] target history end:   {target_history[-1]}")
     print(f"[verify] gt first future step: {target_future_gt[0]}")
+    print(
+        f"[verify] target heading at obs[0] (rad, world): "
+        f"{target_heading_world:.6f}  (= {np.degrees(target_heading_world):.2f} deg)"
+    )
 
     neighbors = _collect_neighbors(frame_ids, target_aid, frames_to_rows)
     print(f"[verify] found {len(neighbors)} neighbor(s) present at all obs frames")
@@ -262,34 +283,62 @@ def main():
         model_overrides={"map_model": "resnet18"},
     )
 
-    pred = inf.infer(target_history, neighbors)
-    print(f"[verify] pred shape: {pred.shape}")
-    print(f"[verify] pred:\n{pred}")
-    print(f"[verify] gt[:6]:\n{target_future_gt[:PROTOCOL_FUTURE_STEPS]}")
+    gt6 = target_future_gt[:PROTOCOL_FUTURE_STEPS]
 
-    # ADE / FDE over the 6-step horizon. Mean-over-K vs ground truth (not
-    # min-over-K, so don't expect the val-split-wide 0.318 m headline).
-    diffs = pred - target_future_gt[:PROTOCOL_FUTURE_STEPS]
-    per_step_err = np.linalg.norm(diffs, axis=-1)
-    ade = float(per_step_err.mean())
-    fde = float(per_step_err[-1])
-    print(f"[verify] ADE (6 steps, mean-of-K vs GT): {ade:.4f} m")
-    print(f"[verify] FDE (6 steps, mean-of-K vs GT): {fde:.4f} m")
+    # -----------------------------------------------------------------------
+    # Run 1: BEFORE the fix — heading_world=None forces the legacy
+    # atan2(v0_y, v0_x) fallback inside `infer()`. This is the path the
+    # "verified ADE 0.254 m" number was measured on. The fallback diverges
+    # from training-time behavior (training reads the stored heading column),
+    # so this number is the degraded baseline.
+    # -----------------------------------------------------------------------
+    print("\n[verify] === Run 1: heading_world=None (legacy atan2 fallback) ===")
+    pred_fallback = inf.infer(target_history, neighbors, heading_world=None)
+    diffs_fb = pred_fallback - gt6
+    per_step_fb = np.linalg.norm(diffs_fb, axis=-1)
+    ade_fb = float(per_step_fb.mean())
+    fde_fb = float(per_step_fb[-1])
+    print(f"[verify] BEFORE  ADE (fallback heading): {ade_fb:.4f} m")
+    print(f"[verify] BEFORE  FDE (fallback heading): {fde_fb:.4f} m")
 
-    # Single-sample tolerance. The val-wide eval is min-over-K=5; mean-of-K
-    # on one sample can easily be 2-3x worse. We complain loudly if it's
-    # more than 5x off, which would indicate a real pipeline bug rather
-    # than sampling noise.
+    # -----------------------------------------------------------------------
+    # Run 2: AFTER the fix — pass the heading read from the .txt's column 5
+    # (radians, world frame, exactly as the training loader uses it). The
+    # resulting map crop matches the training-time distribution.
+    # -----------------------------------------------------------------------
+    print("\n[verify] === Run 2: heading_world=actual heading (training-parity) ===")
+    pred_real = inf.infer(
+        target_history, neighbors, heading_world=target_heading_world
+    )
+    diffs_re = pred_real - gt6
+    per_step_re = np.linalg.norm(diffs_re, axis=-1)
+    ade_re = float(per_step_re.mean())
+    fde_re = float(per_step_re[-1])
+    print(f"[verify] AFTER   ADE (real heading):     {ade_re:.4f} m")
+    print(f"[verify] AFTER   FDE (real heading):     {fde_re:.4f} m")
+
+    # Side-by-side delta for the reveal.
+    print("\n[verify] === Delta (AFTER - BEFORE) ===")
+    print(f"[verify] dADE = {ade_re - ade_fb:+.4f} m  "
+          f"({100.0 * (ade_re - ade_fb) / max(ade_fb, 1e-9):+.1f}%)")
+    print(f"[verify] dFDE = {fde_re - fde_fb:+.4f} m  "
+          f"({100.0 * (fde_re - fde_fb) / max(fde_fb, 1e-9):+.1f}%)")
+
+    # Single-sample tolerance check against the headline (only the AFTER
+    # number is the apples-to-apples comparison — the fix gets us back onto
+    # the training-time distribution). Mean-of-K on one sample can easily
+    # be 2-3x worse than the val-wide min-of-K=5 headline; we still complain
+    # at >5x as a sanity floor.
     HEADLINE_ADE = 0.3184
     HEADLINE_FDE = 0.7997
-    if ade > 5.0 * HEADLINE_ADE:
+    if ade_re > 5.0 * HEADLINE_ADE:
         print(
-            f"[verify] WARN: single-sample ADE {ade:.4f} >> 5x headline "
+            f"[verify] WARN: AFTER single-sample ADE {ade_re:.4f} >> 5x headline "
             f"{HEADLINE_ADE:.4f}; likely a pipeline issue."
         )
-    if fde > 5.0 * HEADLINE_FDE:
+    if fde_re > 5.0 * HEADLINE_FDE:
         print(
-            f"[verify] WARN: single-sample FDE {fde:.4f} >> 5x headline "
+            f"[verify] WARN: AFTER single-sample FDE {fde_re:.4f} >> 5x headline "
             f"{HEADLINE_FDE:.4f}; likely a pipeline issue."
         )
     print("[verify] done")

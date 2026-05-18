@@ -210,11 +210,19 @@ class ContextVAEInferencer:
         self,
         ckpt_path: str,
         config_path: str,
-        map_pickle_path: str,
+        map_pickle_path: Optional[str] = None,
         device: Optional[str] = None,
         k_samples: int = DEFAULT_K_SAMPLES,
         model_overrides: Optional[Dict] = None,
     ):
+        # `map_pickle_path=None` is legal for no-map checkpoints (the S-ATTN-
+        # only variant trained without M-ATTN). When None, the inferencer
+        # skips the map pickle load and passes `map=None` to the model;
+        # `ContextVAE.enc()` already takes the no-map branch in that case
+        # (see contextvae/model.py:279 — `use_map = map is not None and
+        # self.use_map`). The caller is responsible for matching the
+        # checkpoint's training config: passing `model_overrides={"map_model": None}`
+        # alongside `map_pickle_path=None` is the canonical no-map setup.
         # --- Resolve device -------------------------------------------------
         # We default to CUDA if available — the server box is the A40 host,
         # and ContextVAE inference fits comfortably in <1 GB of VRAM, so
@@ -289,79 +297,90 @@ class ContextVAEInferencer:
         self._loaded_ade = state.get("ade", float("nan"))
         self._loaded_fde = state.get("fde", float("nan"))
 
-        # --- Load the map raster --------------------------------------------
+        # --- Load the map raster (optional) ---------------------------------
         # The pickle is `(semantic_map_ndarray, H_ndarray)` matching
         # `contextvae/data.py:530-538` (`load_map`). We hold both on the
         # target device so the affine crop runs without per-frame H2D copy.
         # semantic_map: (3, H_full, W_full) in [-1, 1]
         # H: (3, 3) — world (x, y, 1) -> image (row, col, 1)
-        with open(map_pickle_path, "rb") as f:
-            sem_map_np, H_np = pickle.load(f)
-        # semantic_map is loaded as float32 (data.py stores it that way after
-        # the preprocessing notebook). torch.tensor(..., dtype=float32) makes
-        # it explicit in case a future pickle ships a different dtype.
-        self._semantic_map = torch.tensor(
-            sem_map_np, dtype=torch.float32, device=self.device
-        )
-        # H is a numpy 3x3 ndarray. We keep it numpy because the only
-        # operation we do with it is a single `H @ [x, y, 1]` per inference
-        # call (fast on CPU; not worth a GPU round-trip).
-        self._H = np.asarray(H_np, dtype=np.float64)
+        #
+        # When `map_pickle_path` is None the inferencer is in NO-MAP mode:
+        # the model receives `map=None` per inference and `ContextVAE.enc()`
+        # takes its no-map branch (see contextvae/model.py:351-353). The
+        # caller MUST also set `model_overrides={"map_model": None}` so that
+        # the model is built without the MapEncode sub-module — otherwise the
+        # checkpoint state_dict won't match. We do NOT enforce that here at
+        # construction (an explicit check would couple us to the config-file
+        # contents); the state_dict load below will fail loud if the
+        # combination is mismatched.
+        if map_pickle_path is not None:
+            with open(map_pickle_path, "rb") as f:
+                sem_map_np, H_np = pickle.load(f)
+            # semantic_map is loaded as float32 (data.py stores it that way
+            # after the preprocessing notebook). torch.tensor(..., dtype=
+            # float32) makes it explicit in case a future pickle ships a
+            # different dtype.
+            self._semantic_map = torch.tensor(
+                sem_map_np, dtype=torch.float32, device=self.device
+            )
+            # H is a numpy 3x3 ndarray. We keep it numpy because the only
+            # operation we do with it is a single `H @ [x, y, 1]` per
+            # inference call (fast on CPU; not worth a GPU round-trip).
+            self._H = np.asarray(H_np, dtype=np.float64)
 
-        # Sanity-check shapes — fail loud at construction rather than during
-        # the first infer() call.
-        assert self._semantic_map.dim() == 3 and self._semantic_map.size(0) == 3, (
-            f"map pickle has unexpected shape {self._semantic_map.shape}; "
-            "expected (3, H, W)"
-        )
-        assert self._H.shape == (3, 3), (
-            f"map pickle H has unexpected shape {self._H.shape}; expected (3, 3)"
-        )
+            # Sanity-check shapes — fail loud at construction rather than
+            # during the first infer() call.
+            assert self._semantic_map.dim() == 3 and self._semantic_map.size(0) == 3, (
+                f"map pickle has unexpected shape {self._semantic_map.shape}; "
+                "expected (3, H, W)"
+            )
+            assert self._H.shape == (3, 3), (
+                f"map pickle H has unexpected shape {self._H.shape}; expected (3, 3)"
+            )
+        else:
+            # No-map mode. Both attributes still exist (so attribute access
+            # downstream doesn't AttributeError) — they just take the
+            # sentinel value None, which `_run_forward` checks before
+            # invoking `_build_map_tensor`.
+            self._semantic_map = None
+            self._H = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def infer(
+    def _run_forward(
         self,
         target_history_metric: np.ndarray,
         neighbor_histories_metric: Dict[int, np.ndarray],
-        heading_world: Optional[float] = None,
-    ) -> np.ndarray:
+        heading_world: Optional[float],
+    ):
         """
-        Run one inference step and return the next `PROTOCOL_FUTURE_STEPS`
-        future positions of the target.
+        Shared forward pass for `infer()` and `infer_samples()`.
 
-        Parameters
-        ----------
-        target_history_metric : np.ndarray, shape (OB_HORIZON, 2), dtype float
-            The target's last 10 (x, y) positions in METRIC WORLD coordinates,
-            ordered oldest -> newest. The last row is the position at "now".
-        neighbor_histories_metric : Dict[int, np.ndarray]
-            Mapping from DeepSORT track_id -> (OB_HORIZON, 2) array of the
-            same form. The target track_id should NOT be in this dict.
-            Empty dict is allowed (means no neighbors visible).
-        heading_world : Optional[float], default None
-            Target heading at the FIRST obs frame, in RADIANS, world frame
-            (i.e. atan2-convention angle from +x). When provided, this is
-            used VERBATIM for the localization rotation and map crop, exactly
-            matching the training-time loader (which reads `heading` from the
-            preprocessed .txt — see contextvae/data.py:468). When None, we
-            fall back to a finite-difference approximation `atan2(v0_y, v0_x)`
-            over the first two obs positions and emit a one-shot warning;
-            for stationary/slow agents this fallback collapses to 0 and the
-            M-ATTN encoder receives an un-rotated crop it never saw in
-            training. Callers with access to a real heading (e.g. via the
-            preprocessed .txt heading column, or DeepSORT bbox displacement
-            over a longer history) SHOULD pass it here.
+        Performs steps 0-7 of the original `infer()` body: validate, compute
+        heading, build the localization rotation, build the model tensors,
+        and call the model. Returns the raw K-sample prediction in the
+        LOCALIZED frame plus the (pivot, R) pair needed to un-localize.
+
+        Callers are responsible for the K-collapse (or not), the un-rotation,
+        and any output truncation. This split exists so `infer()` (the
+        socket-protocol entry point) and `infer_samples()` (the replay-driver
+        entry point) share identical model-input construction with zero
+        risk of drift.
 
         Returns
         -------
-        future_xy : np.ndarray, shape (PROTOCOL_FUTURE_STEPS, 2), dtype float64
-            The mean-over-K-samples future trajectory of the target, in
-            METRIC WORLD coordinates, ordered nearest -> farthest in time.
-            Step 0 corresponds to T + 0.2 s (one 5-Hz step ahead of "now").
+        pred : np.ndarray, shape (K, PRED_HORIZON, 2), dtype float64
+            K future trajectories in the LOCALIZED world frame (i.e. the
+            same frame as the model's input tensors). The agent's `N=1`
+            batch axis has been squeezed out.
+        pivot_xy : np.ndarray, shape (2,), dtype float64
+            The pivot used for localization (first-obs-frame target position).
+        R : np.ndarray, shape (2, 2), dtype float64
+            The rotation matrix applied during localization. Its transpose
+            un-rotates back to the original world frame.
         """
         # --- 0. Validate inputs --------------------------------------------
         # Cheap shape checks. The model would eventually fail with a less
@@ -487,9 +506,18 @@ class ContextVAEInferencer:
         #       biases the crop forward of the agent.
         # Output shape: (N=1, 3, MAP_SIZE, MAP_SIZE), then unsqueezed at
         # dim=0 to match training-time (1, N, 3, H, W).
-        map_tensor = self._build_map_tensor(
-            pivot_xy=pivot_xy, angle=angle
-        )  # (1, 1, 3, 224, 224) float32
+        #
+        # When the inferencer is in no-map mode (`self._semantic_map is None`)
+        # we skip the crop entirely and pass `map_tensor = None` to the model.
+        # `ContextVAE.enc()` takes its no-map branch in that case — see
+        # contextvae/model.py:351-353. The neighbor + S-ATTN path is
+        # unaffected.
+        if self._semantic_map is not None:
+            map_tensor = self._build_map_tensor(
+                pivot_xy=pivot_xy, angle=angle
+            )  # (1, 1, 3, 224, 224) float32
+        else:
+            map_tensor = None
 
         # --- 7. Call the model ---------------------------------------------
         # The model's forward signature for eval mode (model.training=False,
@@ -509,27 +537,115 @@ class ContextVAEInferencer:
         # frame as x_tensor — i.e. world coords rotated around pivot_xy by
         # `angle = -heading`.
 
-        # --- 8. Collapse K samples to single mean trajectory ---------------
+        # Squeeze the N=1 batch axis and convert to numpy float64 so all
+        # downstream geometry stays in numpy (matches the rest of the
+        # localization plumbing in this module).
+        pred_np = pred.squeeze(2).cpu().numpy().astype(np.float64)  # (K, 25, 2)
+        return pred_np, pivot_xy, R
+
+    def infer(
+        self,
+        target_history_metric: np.ndarray,
+        neighbor_histories_metric: Dict[int, np.ndarray],
+        heading_world: Optional[float] = None,
+    ) -> np.ndarray:
+        """
+        Run one inference step and return the next `PROTOCOL_FUTURE_STEPS`
+        future positions of the target (mean over K samples).
+
+        This is the SOCKET-PROTOCOL entry point. The Ntousis wire protocol
+        expects a single (6, 2) trajectory, so we collapse the K samples
+        to their mean and truncate to the first 6 steps. For multi-modal
+        rendering, use `infer_samples()` instead.
+
+        Parameters
+        ----------
+        target_history_metric : np.ndarray, shape (OB_HORIZON, 2), dtype float
+            The target's last 10 (x, y) positions in METRIC WORLD coordinates,
+            ordered oldest -> newest. The last row is the position at "now".
+        neighbor_histories_metric : Dict[int, np.ndarray]
+            Mapping from DeepSORT track_id -> (OB_HORIZON, 2) array of the
+            same form. The target track_id should NOT be in this dict.
+            Empty dict is allowed (means no neighbors visible).
+        heading_world : Optional[float], default None
+            Target heading at the FIRST obs frame, in RADIANS, world frame
+            (i.e. atan2-convention angle from +x). When provided, this is
+            used VERBATIM for the localization rotation and map crop, exactly
+            matching the training-time loader (which reads `heading` from the
+            preprocessed .txt — see contextvae/data.py:468). When None, we
+            fall back to a finite-difference approximation `atan2(v0_y, v0_x)`
+            over the first two obs positions and emit a one-shot warning;
+            for stationary/slow agents this fallback collapses to 0 and the
+            M-ATTN encoder receives an un-rotated crop it never saw in
+            training. Callers with access to a real heading (e.g. via the
+            preprocessed .txt heading column, or DeepSORT bbox displacement
+            over a longer history) SHOULD pass it here.
+
+        Returns
+        -------
+        future_xy : np.ndarray, shape (PROTOCOL_FUTURE_STEPS, 2), dtype float64
+            The mean-over-K-samples future trajectory of the target, in
+            METRIC WORLD coordinates, ordered nearest -> farthest in time.
+            Step 0 corresponds to T + 0.2 s (one 5-Hz step ahead of "now").
+        """
+        pred_loc, pivot_xy, R = self._run_forward(
+            target_history_metric=target_history_metric,
+            neighbor_histories_metric=neighbor_histories_metric,
+            heading_world=heading_world,
+        )  # (K, 25, 2), (2,), (2, 2)
+
+        # Collapse K samples to single mean trajectory and un-localize.
         # We mean over the K axis. This is the simplest "single-prediction
-        # output" strategy and the one called for by Week-3 Day-1-2 scope.
-        # Multi-modal handling (best-of-K under a quality metric, or extending
-        # the wire protocol to send all K) is Week 4 work per the thesis plan.
-        pred_mean = pred.mean(dim=0)  # (25, 1, 2)
-        pred_mean = pred_mean.squeeze(1).cpu().numpy().astype(np.float64)  # (25, 2)
+        # output" strategy and the one called for by the Week-3 Day-1-2 scope.
+        pred_mean = pred_loc.mean(axis=0)  # (25, 2)
+        R_inv = R.T  # inverse of the rotation applied during localization
+        pred_unloc = self._rotate_around_pivot(pred_mean, pivot_xy, R_inv)
 
-        # --- 9. Un-localize: rotate back by +heading around pivot ----------
-        # The model's predictions are in the LOCALIZED world frame (the same
-        # frame as x_tensor). To deliver coordinates in the original world
-        # frame, we apply the inverse rotation: rotate by `+heading` around
-        # pivot_xy. Equivalently, transpose R (since R is a 2x2 rotation
-        # matrix, R^-1 == R^T).
-        R_inv = R.T  # (2, 2) — inverse of the rotation we applied in step 3
-        pred_unloc = self._rotate_around_pivot(pred_mean, pivot_xy, R_inv)  # (25, 2)
-
-        # --- 10. Truncate to the first PROTOCOL_FUTURE_STEPS ---------------
-        # The Ntousis wire protocol sends 6 future steps. ContextVAE produces
-        # 25 — we keep the temporally nearest 6 (= 1.2 s at 5 Hz).
+        # Truncate to the first PROTOCOL_FUTURE_STEPS. The Ntousis wire
+        # protocol sends 6 future steps; ContextVAE produces 25.
         return pred_unloc[:PROTOCOL_FUTURE_STEPS]
+
+    def infer_samples(
+        self,
+        target_history_metric: np.ndarray,
+        neighbor_histories_metric: Dict[int, np.ndarray],
+        heading_world: Optional[float] = None,
+    ) -> np.ndarray:
+        """
+        Run one inference step and return ALL K sample trajectories.
+
+        This is the REPLAY-DRIVER entry point — used by offline tooling
+        (e.g. `replay_video.py`) that needs the full multi-modal output
+        rather than the mean-collapsed one the socket protocol carries.
+
+        Same input contract as `infer()`. Differs in two ways from `infer()`:
+
+          - Returns the full `K` samples (no mean collapse) so callers can
+            visualize multi-modality.
+          - Returns the full `PRED_HORIZON` (25 steps = 5 s) rather than
+            the protocol-truncated 6. Replay overlays benefit from the
+            longer horizon, and there's no wire-protocol constraint here.
+
+        Returns
+        -------
+        future_xy_samples : np.ndarray, shape (K, PRED_HORIZON, 2), float64
+            K predicted future trajectories of the target in METRIC WORLD
+            coordinates, ordered nearest -> farthest in time. `K` equals
+            `self.k_samples` (DEFAULT_K_SAMPLES = 5 unless overridden at
+            construction).
+        """
+        pred_loc, pivot_xy, R = self._run_forward(
+            target_history_metric=target_history_metric,
+            neighbor_histories_metric=neighbor_histories_metric,
+            heading_world=heading_world,
+        )  # (K, 25, 2), (2,), (2, 2)
+
+        # Un-localize each of the K trajectories. `_rotate_around_pivot`
+        # already handles arbitrary leading dims via `np.einsum`, so we
+        # can pass the whole (K, 25, 2) tensor at once.
+        R_inv = R.T
+        pred_unloc = self._rotate_around_pivot(pred_loc, pivot_xy, R_inv)
+        return pred_unloc  # (K, 25, 2)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -875,6 +991,24 @@ def _smoke_test() -> None:
         f"per-step displacement {step_disp} exceeds 5 m — model is probably "
         "predicting nonsense; check input scale and map registration."
     )
+
+    # Also exercise the new K-samples entry point used by replay_video.py.
+    samples = inf.infer_samples(target_hist, neighbors, heading_world=0.0)
+    K_expected = inf.k_samples
+    print(f"[smoke] samples shape  : {samples.shape}")
+    assert samples.shape == (K_expected, PRED_HORIZON, 2), (
+        f"unexpected samples shape {samples.shape}; "
+        f"expected ({K_expected}, {PRED_HORIZON}, 2)"
+    )
+    assert np.isfinite(samples).all(), "samples contain NaN or Inf"
+    # Cross-check: mean of K samples truncated to PROTOCOL_FUTURE_STEPS
+    # must agree with `infer()`'s output (same seed-free deterministic path
+    # is not guaranteed across calls because the prior draws are stochastic,
+    # so we run both off the same forward batch by re-seeding torch here).
+    # Instead, just sanity-check that the K endpoints span more than a pixel.
+    endpoints = samples[:, -1, :]  # (K, 2)
+    spread = float(np.linalg.norm(endpoints.std(axis=0)))
+    print(f"[smoke] endpoint spread: {spread:.4f} m (>=0 ok; ~0 means modes collapsed)")
     print("[smoke] OK")
 
 

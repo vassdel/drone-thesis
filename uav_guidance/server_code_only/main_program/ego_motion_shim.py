@@ -64,6 +64,16 @@ _RANSAC_CONFIDENCE = 0.999
 _MIN_INLIERS_OK = 50
 _MIN_INLIER_RATIO = 0.4
 _REANCHOR_TRANSLATION_FRAC = 0.40         # of frame width
+# Quality-based re-anchor: when the live->Kc inlier ratio drops below
+# this floor, promote Kc to a fresher frame. Without this trigger, on
+# real UAV footage Kc stays pinned to the first frame even as the
+# camera slowly pans, the match quality decays linearly, and somewhere
+# around 30-40 frames the per-frame fit starts failing the
+# _MIN_INLIER_RATIO=0.4 acceptance gate — flipping 80%+ of frames to
+# FROZEN. Translation alone can't catch this (the camera might not have
+# translated 40% of frame width even when match quality has tanked).
+# 0.55 leaves a comfortable margin above the acceptance gate.
+_REANCHOR_INLIER_RATIO_FLOOR = 0.55
 _DILATE_FRAC = 0.18                       # of max(bbox_w, bbox_h)
 _DILATE_MIN_PX = 20
 
@@ -80,7 +90,9 @@ class MovingCameraShim:
 
     def __init__(
         self,
-        map_pickle_path: str,
+        map_pickle_path: Optional[str] = None,
+        *,
+        base_shim: Optional[object] = None,
         detector: str = "ORB",
         **detector_kwargs,
     ):
@@ -90,7 +102,28 @@ class MovingCameraShim:
             raise NotImplementedError(
                 f"detector={detector!r} not supported; ORB only for now."
             )
-        self._base = PixelMetricShim(map_pickle_path)
+        # Construct the static K0->world base shim. Two paths:
+        #   - `map_pickle_path` given -> wrap a fresh `PixelMetricShim`.
+        #     This is the original synth-clip / inD/uniD / rounD code path.
+        #   - `base_shim` given       -> use the caller's pre-built shim
+        #     (e.g. `ScaleOnlyShim` for VisDrone or any other dataset that
+        #     ships no homography). The caller's object MUST implement the
+        #     four-method API; we duck-type rather than check explicitly.
+        # Exactly one must be supplied; supplying both is ambiguous.
+        if base_shim is not None and map_pickle_path is not None:
+            raise ValueError(
+                "MovingCameraShim: specify exactly one of `map_pickle_path` "
+                "or `base_shim`, not both."
+            )
+        if base_shim is None and map_pickle_path is None:
+            raise ValueError(
+                "MovingCameraShim: must specify either `map_pickle_path` "
+                "(constructs a PixelMetricShim) or `base_shim` (any "
+                "four-method shim, e.g. ScaleOnlyShim)."
+            )
+        self._base = (
+            base_shim if base_shim is not None else PixelMetricShim(map_pickle_path)
+        )
         orb_kwargs = {**_ORB_DEFAULTS, **detector_kwargs}
         self._orb = cv2.ORB_create(**orb_kwargs)
         self._bf = cv2.BFMatcher(cv2.NORM_HAMMING)
@@ -171,13 +204,14 @@ class MovingCameraShim:
 
         # Fit H_live -> Kc (current keyframe). This is the per-frame fit
         # that drives both the conversion API and the re-anchor decision.
-        H_live_to_Kc, n_inliers_Kc = self._fit_homography(
+        H_live_to_Kc, n_inliers_Kc, n_good_Kc = self._fit_homography(
             kp_live, des_live, self._kp_Kc, self._des_Kc,
         )
         if H_live_to_Kc is None:
             self._last_status = "FROZEN"
             self.n_frozen += 1
             return "FROZEN"
+        inlier_ratio_Kc = (n_inliers_Kc / n_good_Kc) if n_good_Kc > 0 else 0.0
 
         # Compose to K0 frame via the cached Kc->K0 chain.
         H_live_to_K0 = (
@@ -185,21 +219,31 @@ class MovingCameraShim:
             @ H_live_to_Kc.astype(np.float64)
         )
 
-        # Re-anchor only on translation (NOT on inlier count). Inlier-count
-        # triggers cascade in clips where match quality oscillates near
-        # the threshold; translation is monotonic in the camera trajectory
-        # and gives a predictable single re-anchor per ~40% W of motion.
+        # Two re-anchor triggers, EITHER fires:
+        #   (1) translation > 40 % frame width — coarse "we have drifted a
+        #       lot" signal, originally the only trigger.
+        #   (2) live->Kc inlier ratio dropped below the quality floor —
+        #       catches slow pans where translation never reaches 40% W but
+        #       match quality decays into the rejection-gate floor (0.4).
+        #       Without (2), the shim freezes on long natural-pan clips
+        #       (e.g. VisDrone uav0000305_00000_v: 86 % FROZEN without (2)
+        #       even though scene features are abundant).
+        # We DELIBERATELY do not trigger on absolute inlier COUNT: that
+        # oscillates near the gate and produces re-anchor cascades.
         translation_mag = float(
             np.hypot(H_live_to_Kc[0, 2], H_live_to_Kc[1, 2])
         )
-        do_reanchor = translation_mag > _REANCHOR_TRANSLATION_FRAC * W_img
+        do_reanchor = (
+            translation_mag > _REANCHOR_TRANSLATION_FRAC * W_img
+            or inlier_ratio_Kc < _REANCHOR_INLIER_RATIO_FLOOR
+        )
 
         if do_reanchor:
             # Critical: refit `H_new_Kc -> K0` directly against K0
             # descriptors (which we kept around at __init__). Falling back
             # to the chained `H_live_to_K0` would bake in the per-frame
             # RANSAC noise and amplify it on every subsequent re-anchor.
-            H_new_Kc_to_K0, _ = self._fit_homography(
+            H_new_Kc_to_K0, _, _ = self._fit_homography(
                 kp_live, des_live, self._kp_K0, self._des_K0,
             )
             if H_new_Kc_to_K0 is not None:
@@ -235,14 +279,22 @@ class MovingCameraShim:
     def _fit_homography(
         self,
         kp_src, des_src, kp_dst, des_dst,
-    ) -> Tuple[Optional[np.ndarray], int]:
-        """KNN+Lowe+USAC_MAGSAC fit of `H src -> dst`. Returns (H or None, inliers)."""
+    ) -> Tuple[Optional[np.ndarray], int, int]:
+        """
+        KNN+Lowe+USAC_MAGSAC fit of `H src -> dst`.
+
+        Returns
+        -------
+        (H, n_inliers, n_good) — H is None when the fit fails any gate.
+        `n_good` is the post-Lowe match count BEFORE RANSAC; callers use
+        `n_inliers / n_good` as the inlier ratio for re-anchor decisions.
+        """
         if des_src is None or des_dst is None:
-            return None, 0
+            return None, 0, 0
         try:
             knn = self._bf.knnMatch(des_src, des_dst, k=2)
         except cv2.error:
-            return None, 0
+            return None, 0, 0
         good = []
         for pair in knn:
             if len(pair) < 2:
@@ -251,7 +303,7 @@ class MovingCameraShim:
             if m.distance < _LOWE_RATIO * n.distance:
                 good.append(m)
         if len(good) < _MIN_GOOD_MATCHES:
-            return None, 0
+            return None, 0, len(good)
         src_pts = np.array(
             [kp_src[m.queryIdx].pt for m in good], dtype=np.float32
         ).reshape(-1, 1, 2)
@@ -266,11 +318,11 @@ class MovingCameraShim:
             confidence=_RANSAC_CONFIDENCE,
         )
         if H is None or inlier_mask is None:
-            return None, 0
+            return None, 0, len(good)
         n_inliers = int(inlier_mask.sum())
         if n_inliers < _MIN_INLIERS_OK or n_inliers / len(good) < _MIN_INLIER_RATIO:
-            return None, 0
-        return H, n_inliers
+            return None, 0, len(good)
+        return H, n_inliers, len(good)
 
     @staticmethod
     def _build_mask(

@@ -68,7 +68,7 @@ the internals change.
 """
 
 import pickle
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -213,6 +213,90 @@ class PixelMetricShim:
         return np.stack([u, v], axis=1)  # (N, 2) [u, v]
 
 
+class ScaleOnlyShim:
+    """
+    Pixel <-> metric converter with a scalar meters-per-pixel factor.
+
+    For datasets that ship NO orthomap / homography (e.g. VisDroneVDT-2018),
+    we cannot use `PixelMetricShim`. We can still produce a local-metric
+    coordinate system for the model by picking:
+
+      - a per-recording scalar `m_per_px` (calibrated from the known length
+        of an in-scene object — typically a sedan at ~4.5 m);
+      - an `origin_uv = (u0, v0)` pixel location that maps to world (0, 0)
+        — pick the FIRST frame center for the cleanest "drone starts at
+        origin" setup.
+
+    The world frame produced by this shim is **+y up** (image-y is flipped
+    on the way in/out) to match the levelXdata convention the model was
+    trained on. Absolute coordinates are unanchored to any global frame —
+    they're meaningful only RELATIVE to other agents in the same scene,
+    which is all the ContextVAE encoder needs.
+
+    Implements the same four-method API as `PixelMetricShim`, so the
+    replay driver can swap them with no other code changes, and
+    `MovingCameraShim` can compose either as its static base via the
+    `base_shim=` kwarg.
+
+    Limitations
+    -----------
+    A scalar m/px ignores perspective distortion and altitude variation
+    within the scene. For VisDrone clips with significant zoom / altitude
+    drift this is approximate — acceptable for QUALITATIVE Ch6 figures
+    but never publish `minADE` numbers off a scale-only run.
+    """
+
+    def __init__(
+        self,
+        m_per_px: float,
+        origin_uv: Tuple[float, float] = (0.0, 0.0),
+    ):
+        if m_per_px <= 0:
+            raise ValueError(f"m_per_px must be positive; got {m_per_px}")
+        self.m_per_px = float(m_per_px)
+        # Pre-compute px-per-meter so the metric->pixel direction does
+        # a multiply (not a divide) in the hot loop.
+        self.px_per_m = 1.0 / self.m_per_px
+        self.u0 = float(origin_uv[0])
+        self.v0 = float(origin_uv[1])
+
+    # ------------------------------------------------------------------
+    # Single-point API
+    # ------------------------------------------------------------------
+
+    def pixel_to_metric(self, u: float, v: float) -> Tuple[float, float]:
+        """Convert one un-padded image pixel `(u, v)` to world `(x_m, y_m)`."""
+        # u is image col, v is image row. World x grows with u, world y
+        # grows with DECREASING v (image-y points down, world-y points up).
+        x = (float(u) - self.u0) * self.m_per_px
+        y = -(float(v) - self.v0) * self.m_per_px
+        return x, y
+
+    def metric_to_pixel(self, x_m: float, y_m: float) -> Tuple[float, float]:
+        """Convert one world `(x_m, y_m)` to un-padded image pixel `(u, v)`."""
+        u = self.u0 + float(x_m) * self.px_per_m
+        v = self.v0 - float(y_m) * self.px_per_m  # y-flip
+        return u, v
+
+    # ------------------------------------------------------------------
+    # Vectorized API for whole histories at once
+    # ------------------------------------------------------------------
+
+    def pixels_to_metric(self, uv: np.ndarray) -> np.ndarray:
+        """Vectorized `pixel_to_metric`. `uv` is (N, 2) of [u, v]; returns (N, 2)."""
+        uv = np.asarray(uv, dtype=np.float64).reshape(-1, 2)
+        x = (uv[:, 0] - self.u0) * self.m_per_px
+        y = -(uv[:, 1] - self.v0) * self.m_per_px
+        return np.stack([x, y], axis=1)
+
+    def metrics_to_pixel(self, xy: np.ndarray) -> np.ndarray:
+        """Vectorized `metric_to_pixel`. `xy` is (N, 2) of [x, y]; returns (N, 2)."""
+        xy = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+        u = self.u0 + xy[:, 0] * self.px_per_m
+        v = self.v0 - xy[:, 1] * self.px_per_m
+        return np.stack([u, v], axis=1)
+
+
 # ---------------------------------------------------------------------------
 # Self-test: round-trip a known agent position from the val .txt file.
 # Run via:  python uav_guidance/server_code_only/main_program/pixel_metric_shim.py
@@ -265,6 +349,32 @@ def _self_test() -> None:
     assert 1.0 < step_px < 50.0, (
         f"unrealistic px-per-meter scale {step_px} — expected 5-15 px/m for inD"
     )
+
+    # ----- ScaleOnlyShim round-trip ----------------------------------------
+    # No external fixture needed — pure math. Pick a plausible VisDrone
+    # calibration: 1280x720 frame, ~0.05 m/px (typical mid-altitude UAV),
+    # origin at frame center.
+    scale = ScaleOnlyShim(m_per_px=0.05, origin_uv=(640.0, 360.0))
+    # World origin should land at the configured pixel origin.
+    u0, v0 = scale.metric_to_pixel(0.0, 0.0)
+    assert (u0, v0) == (640.0, 360.0), f"unexpected origin: {(u0, v0)}"
+    # +1 m in world x should move +20 px (0.05 m/px -> 20 px/m).
+    u_e, v_e = scale.metric_to_pixel(1.0, 0.0)
+    assert abs(u_e - 660.0) < 1e-9 and abs(v_e - 360.0) < 1e-9, (
+        f"+1m east: expected (660, 360); got {(u_e, v_e)}"
+    )
+    # +1 m in world y should move -20 px in image v (image-y points down).
+    u_n, v_n = scale.metric_to_pixel(0.0, 1.0)
+    assert abs(u_n - 640.0) < 1e-9 and abs(v_n - 340.0) < 1e-9, (
+        f"+1m north: expected (640, 340); got {(u_n, v_n)}"
+    )
+    # Round-trip a batch of points.
+    pts_m = np.array([[0, 0], [1, 0], [0, 1], [-3, 5]], dtype=np.float64)
+    pts_px = scale.metrics_to_pixel(pts_m)
+    pts_m_back = scale.pixels_to_metric(pts_px)
+    err_batch = np.linalg.norm(pts_m_back - pts_m, axis=-1).max()
+    print(f"[shim-test] ScaleOnlyShim round-trip max err: {err_batch:.2e} m")
+    assert err_batch < 1e-9, f"ScaleOnly round-trip err {err_batch}"
 
     print("[shim-test] OK")
 

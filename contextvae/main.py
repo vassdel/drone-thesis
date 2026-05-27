@@ -107,7 +107,8 @@ if __name__ == "__main__":
     ##### load model                                                         ######
     #####                                                                    ######
     ###############################################################################
-    model = ContextVAE(**config.model)
+    model_cls = getattr(config, "model_cls", ContextVAE)
+    model = model_cls(**config.model)
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
     start_epoch = 0

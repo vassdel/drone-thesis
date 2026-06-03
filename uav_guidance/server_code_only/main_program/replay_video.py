@@ -60,6 +60,9 @@ Per the Week 3 plan and the user-confirmed choice:
 - Mode marker: small filled circles at the endpoint of each sample.
 
 Usage
+Use the following to see available aid:
+
+cut -d, -f2 data/visdrone/uav0000305_00000_v/annotations.txt | sort -n | uniq -c
 -----
     python replay_video.py \
         --input tmp/synth_uav_clip.mp4 \

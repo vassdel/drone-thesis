@@ -3,6 +3,9 @@ data/
 levelx/
 full-visdrone
 VisDrone2019-MOT-test-dev
+VisDrone2019-MOT-train
+VisDrone2019-VID-test-dev
+VisDrone-DroneVehicle
 scripts/nuscenes-dataset-folder/
 scripts/nuscenes-raw-dataset/
 uniD-dataset-v1.1/

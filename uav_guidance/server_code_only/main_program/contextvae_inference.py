@@ -255,6 +255,12 @@ class ContextVAEInferencer:
             submodule_search_locations=[os.path.dirname(config_path)],
         )
         self._config = importlib.util.module_from_spec(spec)
+        # Register in sys.modules BEFORE exec so configs that inherit via a
+        # relative import (e.g. visdrone_eval_5s.py's `from .levelx_train
+        # import *`) can resolve their parent package — `.` resolves to this
+        # module's name, which must be importable. main.py:41 and
+        # eval_perseq.py:47 do the same; keep in sync.
+        sys.modules[spec.name] = self._config
         spec.loader.exec_module(self._config)
 
         # --- Instantiate the model ------------------------------------------

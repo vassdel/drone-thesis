@@ -3,24 +3,30 @@ Offline replay driver: video in -> ContextVAE K=5 trajectory overlays out.
 
 Purpose
 -------
-Renders the Week 3 deliverable: an offline replay of a UAV video through
+Renders the deliverable: an offline replay of a UAV video through
 the integrated ContextVAE pipeline (`ContextVAEInferencer` +
 `PixelMetricShim` / `MovingCameraShim`), producing K=5 future trajectory
 samples per tracked agent as overlays on the source video.
 
 Unlike `scene_recog_socket_yolov8.py` (the live socket server), this driver
-runs entirely offline against a recorded mp4 and a JSON bbox source. The
-K=5 trajectories are kept individually (not mean-collapsed) so the overlay
-shows the model's multi-modality.
+runs entirely offline against a recorded mp4 (`--input`) OR a folder of
+frame images (`--input-images`). The K=5 trajectories are kept individually
+(not mean-collapsed) so the overlay shows the model's multi-modality.
 
-Bbox source policy
-------------------
-The synthetic clip at `tmp/synth_uav_clip.mp4` contains rendered rectangles
-on top of the inD_01 orthomap. YOLOv8 (COCO-trained) does NOT reliably
-detect those rectangles as cars, so for the synthetic-clip path we read
-ground-truth bboxes directly from `tmp/synth_uav_clip_gt.json`. For real
-UAV footage (VisDrone in a later step), a YOLO+DeepSORT path would be
-needed — out of scope for this driver as written.
+Bbox sources (`--anno-format`)
+------------------------------
+Three ways to obtain the per-frame agent boxes the pipeline tracks:
+  - `synth-json`    : ground-truth boxes from the synthetic-clip JSON
+                      (`synth_clip_gen.py`). Used for the inD orthomap demo;
+                      YOLOv8 can't reliably detect the rendered rectangles.
+  - `visdrone-mot`  : ground-truth boxes from a VisDrone-MOT
+                      `annotations.txt` (the GT-driven replay).
+  - `yolo-deepsort` : live YOLOv8 + DeepSORT detection on the frames — the
+                      "zero annotations" END-TO-END path. No annotation file;
+                      pixel->metric scale is auto-calibrated from detected
+                      car bboxes (override with `--scale-mpp`). Requires
+                      `ultralytics` + `deep_sort_realtime` (present in the
+                      `new_xupei_env` conda env).
 
 Two-mode operation
 ------------------
@@ -60,18 +66,66 @@ Per the Week 3 plan and the user-confirmed choice:
 - Mode marker: small filled circles at the endpoint of each sample.
 
 Usage
-Use the following to see available aid:
-
-cut -d, -f2 data/visdrone/uav0000305_00000_v/annotations.txt | sort -n | uniq -c
 -----
-    python replay_video.py \
-        --input tmp/synth_uav_clip.mp4 \
-        --gt-json tmp/synth_uav_clip_gt.json \
-        --map-pkl data/levelx/map/inD_01.pkl \
-        --ckpt tmp/levelx_full_map_v1/ckpt-best \
-        --config configs/levelx_train.py \
-        --ego-motion false \
-        --output tmp/replay_synth_stationary.mp4
+Run from the repo root (this file adds its own dir to sys.path, so the
+sibling-module imports resolve regardless of cwd). The yolo-deepsort path
+needs the detector deps, so use:
+    PY=/home/vdelis/anaconda3/envs/new_xupei_env/bin/python
+    DRIVER=uav_guidance/server_code_only/main_program/replay_video.py
+
+(1) END-TO-END, zero annotations — YOLO + DeepSORT on raw VisDrone frames.
+    Moving camera -> --ego-motion true; scale auto-calibrated from cars.
+    Frames may sit directly in the folder OR in an `img/` subfolder.
+
+    $PY $DRIVER \
+        --input-images VisDrone2019-MOT-train/sequences/uav0000248_00001_v \
+        --anno-format  yolo-deepsort \
+        --yolo-weights yolov8x_visdrone.pt \
+        --map-model    none \
+        --ckpt         tmp/nomap-s-attn/ckpt-best \
+        --config       configs/visdrone_eval_5s.py \
+        --ego-motion   true \
+        --output       tmp/visdrone_e2e/e2e_uav0000248_00001_v.mp4
+
+    # Batch the whole eval set (resolves frames per split automatically):
+    #   bash run_visdrone_e2e.sh data/visdrone_levelx/val
+    #   bash run_visdrone_e2e.sh data/visdrone_levelx/train 'uav0000248*'
+
+(2) GT-DRIVEN VisDrone replay — boxes from annotations.txt (no detector).
+    --scale-mpp is the manual px->m calibration; --map-model none.
+
+    $PY $DRIVER \
+        --input-images data/visdrone/uav0000305_00000_v/img \
+        --anno-format  visdrone-mot \
+        --gt-json      data/visdrone/uav0000305_00000_v/annotations.txt \
+        --scale-mpp    0.125 \
+        --map-model    none \
+        --ckpt         tmp/nomap-s-attn/ckpt-best \
+        --config       configs/visdrone_eval_5s.py \
+        --ego-motion   true \
+        --output       tmp/replay_visdrone_gt.mp4
+
+(3) SYNTHETIC inD clip — orthomap M-ATTN checkpoint, stationary camera.
+    --map-pkl triggers PixelMetricShim; --map-model resnet18.
+
+    $PY $DRIVER \
+        --input       tmp/synth_uav_clip.mp4 \
+        --anno-format synth-json \
+        --gt-json     tmp/synth_uav_clip_gt.json \
+        --map-pkl     data/levelx/map/inD_01.pkl \
+        --map-model   resnet18 \
+        --ckpt        tmp/levelx_full_map_v1/ckpt-best \
+        --config      configs/levelx_train.py \
+        --ego-motion  false \
+        --output      tmp/replay_synth_stationary.mp4
+
+Choosing the target vehicle
+---------------------------
+The auto-picker selects the most-moving agent. Force a specific one with
+`--target-aid <id>`. For visdrone-mot, list GT ids with:
+    cut -d, -f2 data/visdrone/<seq>/annotations.txt | sort -n | uniq -c
+For yolo-deepsort the ids are DeepSORT's own (printed in the run log and the
+on-frame HUD), NOT the GT ids.
 """
 
 from __future__ import annotations
@@ -119,25 +173,51 @@ def parse_args() -> argparse.Namespace:
 
     # ---- annotation source ------------------------------------------------
     p.add_argument(
-        "--anno-format", choices=("synth-json", "visdrone-mot"),
+        "--anno-format", choices=("synth-json", "visdrone-mot", "yolo-deepsort"),
         default="synth-json",
         help=(
-            "Which schema the --gt-json file follows. 'synth-json' is the "
-            "synthetic-clip JSON written by `synth_clip_gen.py`. "
-            "'visdrone-mot' is the comma-separated VisDroneVDT-2018 MOT "
-            "annotations.txt format."
+            "Where agent bboxes come from. 'synth-json' is the synthetic-clip "
+            "JSON written by `synth_clip_gen.py`. 'visdrone-mot' is the "
+            "comma-separated VisDroneVDT-2018 MOT annotations.txt. "
+            "'yolo-deepsort' runs live YOLOv8 + DeepSORT on the frames (no "
+            "annotation file needed — the 'zero annotations' end-to-end path)."
         ),
     )
     p.add_argument(
-        "--gt-json", required=True,
+        "--gt-json", default=None,
         help=(
             "Path to the per-frame agent bbox source. For synth-json this is "
-            "the JSON; for visdrone-mot this is the annotations.txt file."
+            "the JSON; for visdrone-mot this is the annotations.txt file. "
+            "Not used (and rejected) for yolo-deepsort."
+        ),
+    )
+
+    # ---- yolo-deepsort detector args (only used for --anno-format yolo-deepsort) ---
+    p.add_argument(
+        "--yolo-weights", default="yolov8x_visdrone.pt",
+        help=(
+            "Path to the YOLOv8 weights for the yolo-deepsort path. Default "
+            "resolves relative to the working directory."
+        ),
+    )
+    p.add_argument(
+        "--yolo-conf", type=float, default=0.7,
+        help="YOLO confidence threshold for the yolo-deepsort path (default 0.7).",
+    )
+    p.add_argument(
+        "--keep-classes", default=None,
+        help=(
+            "Comma-separated vehicle class NAMES to keep as trajectory targets "
+            "(matched case-insensitively against the model's own names map). "
+            "Default: car,van,truck,bus."
         ),
     )
 
     # ---- shim selection: one of --map-pkl OR --scale-mpp ------------------
-    pix = p.add_mutually_exclusive_group(required=True)
+    # Not `required` at the group level: the yolo-deepsort path auto-calibrates
+    # scale from car detections, so it needs NEITHER. The per-format validation
+    # below enforces "exactly one" for synth-json / visdrone-mot.
+    pix = p.add_mutually_exclusive_group(required=False)
     pix.add_argument(
         "--map-pkl",
         help=(
@@ -207,6 +287,33 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     args = p.parse_args()
+
+    # --- per-format bbox-source validation --------------------------------
+    if args.anno_format == "yolo-deepsort":
+        # Live detector: no annotation file, and an orthomap makes no sense
+        # (arbitrary footage, scale auto-calibrated from car detections).
+        if args.gt_json is not None:
+            p.error("--gt-json is not used with --anno-format yolo-deepsort.")
+        if args.map_pkl is not None:
+            p.error(
+                "--map-pkl is not supported with yolo-deepsort (no registered "
+                "orthomap for live footage). Omit it; scale is auto-calibrated, "
+                "or pass --scale-mpp to override. Use --map-model none."
+            )
+        if args.map_model != "none":
+            p.error(
+                "yolo-deepsort has no orthomap; pass --map-model none "
+                "(use the no-map S-ATTN checkpoint)."
+            )
+    else:
+        # File-based sources REQUIRE the annotation file and exactly one shim.
+        if args.gt_json is None:
+            p.error(f"--gt-json is required for --anno-format {args.anno_format}.")
+        if args.map_pkl is None and args.scale_mpp is None:
+            p.error(
+                f"--anno-format {args.anno_format} needs a shim: pass one of "
+                "--map-pkl (orthomap) or --scale-mpp (scalar calibration)."
+            )
 
     # Cross-arg consistency: --scale-mpp implies no map, which means we MUST
     # use the no-map ckpt; --map-pkl REQUIRES the M-ATTN ckpt (or the
@@ -419,11 +526,26 @@ class ImageFolderCapture:
 
     def __init__(self, folder: str, assumed_fps: float = 30.0):
         import glob
-        paths: List[str] = []
-        for ext in ("*.jpg", "*.jpeg", "*.png"):
-            paths.extend(glob.glob(os.path.join(folder, ext)))
+
+        def _glob_frames(d: str) -> List[str]:
+            out: List[str] = []
+            for ext in ("*.jpg", "*.jpeg", "*.png"):
+                out.extend(glob.glob(os.path.join(d, ext)))
+            return out
+
+        # Accept BOTH on-disk layouts transparently:
+        #   <folder>/*.jpg            (raw VisDrone splits: sequences/<seq>/*.jpg)
+        #   <folder>/img/*.jpg        (reorganized: data/visdrone/<seq>/img/*.jpg)
+        # If the folder itself has no frames but an `img/` subdir does, descend
+        # into it. This is what lets a visdrone_levelx-driven run point at the
+        # bare sequence dir regardless of which layout that split uses.
+        paths = _glob_frames(folder)
+        if not paths and os.path.isdir(os.path.join(folder, "img")):
+            paths = _glob_frames(os.path.join(folder, "img"))
         if not paths:
-            raise FileNotFoundError(f"No frames in {folder!r}")
+            raise FileNotFoundError(
+                f"No frames in {folder!r} (looked in the folder and in img/)."
+            )
         paths.sort()
         self._paths = paths
         self._idx = 0
@@ -459,6 +581,181 @@ class ImageFolderCapture:
     def release(self):
         # No file handles held open between read() calls.
         pass
+
+
+# ---------------------------------------------------------------------------
+# Bbox-source loader (live YOLOv8 + DeepSORT — the "zero annotations" path)
+# ---------------------------------------------------------------------------
+
+# Scale-calibration constants, mirrored from preprocessing/process_visdrone.py
+# so the end-to-end path produces the same metric scale as the GT-based eval.
+_ASSUMED_CAR_LEN_M = 4.5      # sedan length used to turn px -> metres
+_DEFAULT_MPP = 0.045         # hard fallback m/px if no car ever detected
+# Default vehicle class NAMES (lowercase). Resolved against the model's own
+# `names` map at load time — NOT hardcoded ids — because a "visdrone" YOLO
+# checkpoint may actually carry COCO class indices (car=2, bus=5, truck=7,
+# and no "van"), so id {4,5,6,9} would select the wrong classes entirely.
+_DEFAULT_KEEP_CLASS_NAMES = frozenset({"car", "van", "truck", "bus"})
+
+
+def load_yolo_deepsort_bboxes(
+    input_path: str,
+    is_image_folder: bool,
+    weights_path: str,
+    conf: float,
+    keep_class_names: frozenset,
+    assumed_fps: float = 30.0,
+    scale_override: Optional[float] = None,
+) -> Tuple[
+    Dict[int, List[Dict]], int, Tuple[int, int], int, int,
+    Dict[int, List[Tuple[float, float, float, float]]], float,
+]:
+    """
+    Run YOLOv8 + DeepSORT over a frame source as a PRE-PASS and emit the same
+    `by_frame` schema the GT loaders return — but with boxes produced live by
+    the detector instead of read from an annotation file. This is the
+    "zero annotations" end-to-end path (YOLO detection -> ContextVAE).
+
+    Why a pre-pass (not interleaved with the render loop)?
+    -----------------------------------------------------
+    `pick_target_aid` (called in main() before the render loop starts) scans
+    the FULL `by_frame` to choose the target. A detector running inside the
+    render loop couldn't populate `by_frame` in time. DeepSORT also needs
+    frames in temporal order, which a single forward pass gives us anyway.
+
+    Detection helper
+    ----------------
+    We deliberately do NOT reuse `scene_recog_socket_yolov8.get_boxes_feats_yolov8`:
+    that calls `model(img, conf=.., return_class_logits=True)` — a Ntousis
+    ultralytics patch whose `f_lst` output exists only for the re-ID
+    similarity map, which replay does not need. We call the model plainly and
+    build the `(ltwh, conf, cls)` tuples DeepSORT consumes.
+
+    Class resolution
+    ----------------
+    Vehicle classes are resolved by NAME from `model.names` (see
+    `_DEFAULT_KEEP_CLASS_NAMES`). Cars (specifically) drive the auto-scale.
+
+    Returns
+    -------
+    Same 6 fields as `load_visdrone_bboxes`, PLUS a 7th:
+    by_frame, n_frames, k0_shape_hw, frame_repeat, fps, mask_bboxes_by_frame,
+    m_per_px
+        `mask_bboxes_by_frame` holds EVERY raw detection (all classes) so the
+        ORB feature mask in ego-motion mode excludes all moving objects — the
+        same all-bboxes policy `load_visdrone_bboxes` uses to avoid the ORB
+        fit freezing. `m_per_px` is the auto-calibrated scale (or the override).
+    """
+    # Lazy imports: only the yolo-deepsort path needs these heavy deps, so the
+    # synth-json / visdrone-mot paths keep working without them installed.
+    from ultralytics import YOLO
+    from deep_sort_realtime.deepsort_tracker import DeepSort
+
+    model = YOLO(weights_path)
+    names = {int(cid): str(nm) for cid, nm in model.names.items()}
+    vehicle_ids = {cid for cid, nm in names.items() if nm.lower() in keep_class_names}
+    car_ids = {cid for cid, nm in names.items() if nm.lower() == "car"}
+    if not vehicle_ids:
+        raise SystemExit(
+            f"[replay] yolo-deepsort: none of {sorted(keep_class_names)} match "
+            f"the model's class names {names}. Pass --keep-classes with names "
+            "that exist in this checkpoint."
+        )
+    print(
+        "[replay] yolo-deepsort: weights={} resolved vehicle classes {}".format(
+            os.path.basename(weights_path),
+            {cid: names[cid] for cid in sorted(vehicle_ids)},
+        )
+    )
+
+    # Frame source (same two backends as the render loop).
+    if is_image_folder:
+        cap = ImageFolderCapture(input_path, assumed_fps=assumed_fps)
+    else:
+        cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        raise SystemExit(f"[replay] yolo-deepsort: could not open {input_path!r}")
+
+    tracker = DeepSort(max_age=3, n_init=2)
+
+    by_frame: Dict[int, List[Dict]] = {}
+    mask_bboxes_by_frame: Dict[int, List[Tuple[float, float, float, float]]] = {}
+    car_long_axes: List[float] = []
+    h_img = w_img = 0
+    n_det_total = 0
+    frame_idx = -1
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frame_idx += 1
+        if h_img == 0:
+            h_img, w_img = frame.shape[:2]
+
+        # --- detect (plain call; no return_class_logits / no f_lst) ---------
+        res = model(frame, conf=conf, verbose=False)[0]
+        results: List[Tuple[List[float], float, int]] = []
+        boxes = res.boxes
+        if boxes is not None and len(boxes) > 0:
+            xyxy = boxes.xyxy.cpu().numpy()
+            clss = boxes.cls.cpu().numpy().astype(int)
+            confs = boxes.conf.cpu().numpy()
+            for i in range(len(xyxy)):
+                x1, y1, x2, y2 = (float(v) for v in xyxy[i])
+                ltwh = [x1, y1, x2 - x1, y2 - y1]
+                results.append((ltwh, float(confs[i]), int(clss[i])))
+        n_det_total += len(results)
+
+        # EVERY raw detection feeds the ORB mask (ego-motion robustness).
+        mask_bboxes_by_frame[frame_idx] = [tuple(d[0]) for d in results]
+
+        # Vehicle subset goes to the tracker; cars also drive the scale calib.
+        veh = [d for d in results if d[2] in vehicle_ids]
+        for ltwh, _cf, cls in veh:
+            if cls in car_ids:
+                car_long_axes.append(max(ltwh[2], ltwh[3]))
+
+        # DeepSORT: pass the FRAME via the `frame=` kwarg so the mobilenet
+        # embedder computes appearance features. (The Ntousis server passes it
+        # positionally, where it lands in `embeds` — a latent bug we avoid.)
+        tracks = tracker.update_tracks(veh, frame=frame)
+        for tr in tracks:
+            if not tr.is_confirmed():
+                continue
+            l, t, w, h = (float(v) for v in tr.to_ltwh())
+            by_frame.setdefault(frame_idx, []).append({
+                "aid": int(tr.track_id),
+                "ltwh_live": [l, t, w, h],
+                "center_live": [l + w / 2.0, t + h / 2.0],
+                # No GT world frame for live detections — disables the
+                # post-hoc world-error diagnostic in the render loop.
+                "world_gt": None,
+            })
+    cap.release()
+    n_frames = frame_idx + 1
+
+    # --- auto-scale: m/px = assumed car length / median car-bbox long axis ---
+    if scale_override is not None:
+        m_per_px = float(scale_override)
+        scale_src = "override"
+    elif car_long_axes:
+        m_per_px = _ASSUMED_CAR_LEN_M / float(np.median(car_long_axes))
+        scale_src = f"car-median(n={len(car_long_axes)})"
+    else:
+        m_per_px = _DEFAULT_MPP
+        scale_src = "default(no cars detected)"
+
+    n_tracks = len({a["aid"] for agents in by_frame.values() for a in agents})
+    print(
+        "[replay] yolo-deepsort: {} frames  {} detections  {} confirmed tracks  "
+        "m_per_px={:.5f} ({})".format(
+            n_frames, n_det_total, n_tracks, m_per_px, scale_src,
+        )
+    )
+    return (
+        by_frame, n_frames, (h_img, w_img), 6, int(round(assumed_fps)),
+        mask_bboxes_by_frame, m_per_px,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -716,10 +1013,15 @@ def main() -> int:
     print(f"[replay] input        = {args.input or args.input_images}")
     print(f"[replay] anno-format  = {args.anno_format}")
     print(f"[replay] gt           = {args.gt_json}")
-    print(
-        f"[replay] shim-source  = "
-        f"{'map-pkl ' + args.map_pkl if args.map_pkl else 'scale-mpp ' + str(args.scale_mpp)}"
-    )
+    if args.map_pkl:
+        shim_src = f"map-pkl {args.map_pkl}"
+    elif args.scale_mpp is not None:
+        shim_src = f"scale-mpp {args.scale_mpp}"
+    elif args.anno_format == "yolo-deepsort":
+        shim_src = "scale-mpp auto (yolo car-detection calibration)"
+    else:
+        shim_src = "(none)"
+    print(f"[replay] shim-source  = {shim_src}")
     print(f"[replay] ckpt         = {args.ckpt}")
 
     # --- Bbox stream ----------------------------------------------------
@@ -732,11 +1034,14 @@ def main() -> int:
     # is vehicle-only. For the synth path we fall back to the vehicle
     # bboxes (no separate non-vehicle annotations exist in that schema).
     mask_bboxes_by_frame: Optional[Dict[int, List[Tuple[float, float, float, float]]]] = None
+    # Scale auto-calibrated by the yolo-deepsort detector pre-pass; None for the
+    # file-based sources (which carry an explicit --scale-mpp or --map-pkl).
+    auto_scale_mpp: Optional[float] = None
     if args.anno_format == "synth-json":
         by_frame, n_frames, k0_shape_hw, frame_repeat, fps_src = load_gt_bboxes(
             args.gt_json
         )
-    else:  # visdrone-mot
+    elif args.anno_format == "visdrone-mot":
         if args.input_images is None:
             print(
                 "[replay] ERROR: --anno-format visdrone-mot requires "
@@ -748,6 +1053,25 @@ def main() -> int:
             by_frame, n_frames, k0_shape_hw, frame_repeat, fps_src,
             mask_bboxes_by_frame,
         ) = load_visdrone_bboxes(args.gt_json, args.input_images)
+    else:  # yolo-deepsort (live detection; no annotation file)
+        # Accepts either --input (mp4) or --input-images (folder).
+        is_folder = args.input_images is not None
+        src_path = args.input_images if is_folder else args.input
+        keep_names = (
+            frozenset(s.strip().lower() for s in args.keep_classes.split(",") if s.strip())
+            if args.keep_classes else _DEFAULT_KEEP_CLASS_NAMES
+        )
+        (
+            by_frame, n_frames, k0_shape_hw, frame_repeat, fps_src,
+            mask_bboxes_by_frame, auto_scale_mpp,
+        ) = load_yolo_deepsort_bboxes(
+            input_path=src_path,
+            is_image_folder=is_folder,
+            weights_path=args.yolo_weights,
+            conf=args.yolo_conf,
+            keep_class_names=keep_names,
+            scale_override=args.scale_mpp,
+        )
     fps_step = args.fps_step if args.fps_step is not None else frame_repeat
     target_aid = pick_target_aid(by_frame, args.target_aid)
     print(
@@ -780,13 +1104,24 @@ def main() -> int:
         base_shim = PixelMetricShim(args.map_pkl)
     else:
         # ScaleOnlyShim: default origin to frame center (read from bbox source).
+        # Scale priority: explicit --scale-mpp > yolo-deepsort auto-calibration.
+        # (For yolo-deepsort the loader already folded --scale-mpp into
+        # `auto_scale_mpp` when present, so a single source of truth remains.)
         h_img, w_img = k0_shape_hw
         if args.origin_uv is not None:
             origin_uv = (float(args.origin_uv[0]), float(args.origin_uv[1]))
         else:
             origin_uv = (w_img / 2.0, h_img / 2.0)
+        effective_mpp = args.scale_mpp if args.scale_mpp is not None else auto_scale_mpp
+        if effective_mpp is None:
+            print(
+                "[replay] ERROR: no pixel->metric scale available (need "
+                "--scale-mpp, --map-pkl, or the yolo-deepsort auto-calibration).",
+                file=sys.stderr,
+            )
+            return 2
         base_shim = ScaleOnlyShim(
-            m_per_px=float(args.scale_mpp), origin_uv=origin_uv,
+            m_per_px=float(effective_mpp), origin_uv=origin_uv,
         )
         print(
             f"[replay] ScaleOnlyShim: m_per_px={base_shim.m_per_px:.6f} "

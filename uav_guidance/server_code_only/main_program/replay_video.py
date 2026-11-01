@@ -53,7 +53,7 @@ Usage
 Run from the repo root (this file adds its own dir to sys.path, so sibling
 imports resolve regardless of cwd). The yolo-deepsort path needs the detector
 deps:
-    PY=/home/vdelis/anaconda3/envs/new_xupei_env/bin/python
+    PY=/home/vdelis/anaconda3/envs/uav-traj/bin/python
     DRIVER=uav_guidance/server_code_only/main_program/replay_video.py
 
 (1) END-TO-END, zero annotations — YOLO + DeepSORT on raw VisDrone frames.

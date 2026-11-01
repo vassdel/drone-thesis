@@ -36,7 +36,7 @@
 set -uo pipefail
 
 PROJ=/home/vdelis/ContextVAE
-PY=/home/vdelis/anaconda3/envs/new_xupei_env/bin/python
+PY=/home/vdelis/anaconda3/envs/uav-traj/bin/python
 DRIVER=uav_guidance/server_code_only/main_program/replay_video.py
 
 # --- inputs -----------------------------------------------------------------

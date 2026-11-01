@@ -19,7 +19,7 @@ matches closely (batch composition differs at the sequence boundary, which
 slightly perturbs the stochastic sampling order).
 
 Usage (same args as main.py eval; omitting --map_dir selects the no-map path):
-    PY=/home/vdelis/anaconda3/envs/new_xupei_env/bin/python
+    PY=/home/vdelis/anaconda3/envs/uav-traj/bin/python
     $PY -m contextvae.eval_perseq --test data/visdrone_levelx/val \
         --config configs/visdrone_eval_2s.py --ckpt tmp/nomap-s-attn/ckpt-best
 """

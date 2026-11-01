@@ -7,7 +7,7 @@ runs `model(x, neighbor, *m, n_predictions=K)`, and writes one PNG per agent.
 
 Usage (run from repo root with the project conda env active):
 
-    conda activate new_xupei_env
+    conda activate uav-traj
     python -m contextvae.visualize \
         --config configs/levelx_eval.py \
         --ckpt   tmp/levelx_smoke/ckpt-best \

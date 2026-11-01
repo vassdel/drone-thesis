@@ -21,7 +21,7 @@ TRAIN_ROOT="${2:-visdrone_raw/VisDrone2019-MOT-train}"
 # ---------------------------------------------------------------------------
 
 PROJ=/home/vdelis/ContextVAE
-PY=/home/vdelis/anaconda3/envs/new_xupei_env/bin/python
+PY=/home/vdelis/anaconda3/envs/uav-traj/bin/python
 CKPT=tmp/nomap-s-attn/ckpt-best
 OUTROOT=data/visdrone_levelx
 LOGDIR=tmp/visdrone_eval

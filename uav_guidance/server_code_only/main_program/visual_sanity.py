@@ -1,58 +1,41 @@
 """
-Visual sanity check for the ContextVAE inference path used by the
-Ntousis server-side pipeline.
+Visual sanity check for the ContextVAE server-side inference path.
 
 What it does
 ------------
-1. Loads the un-padded inD_01 background PNG (the same image the
-   preprocessing notebook started from before padding by EXT_PAD).
-2. Reads inD_01.txt to pick one TARGET agent with a complete
-   (OB_HORIZON + PRED_HORIZON) window — same agent_id=0 used in
-   `verify_inference.py`.
-3. Runs `ContextVAEInferencer.infer` to produce 6 future positions
-   in metric coords.
-4. Uses `PixelMetricShim.metrics_to_pixel` to project those positions
-   back to un-padded image pixels.
-5. Draws three overlays on the background:
-     - GREEN dots  : the 10 observation positions.
-     - YELLOW dots : the next 6 ground-truth positions (truth).
-     - RED dots    : the 6 predicted positions.
+1. Loads the un-padded inD_01 background PNG.
+2. Reads inD_01.txt and picks one TARGET agent with a complete
+   (OB_HORIZON + PRED_HORIZON) window (reusing verify_inference.py's helpers).
+3. Runs `ContextVAEInferencer.infer` for 6 future positions in metric coords.
+4. Projects them back to un-padded image pixels via `metrics_to_pixel`.
+5. Overlays dots + polylines: green = 10 observations, yellow = 6 ground-truth
+   future, red = 6 predicted.
 6. Saves to `tmp/contextvae_visual_sanity.png`.
 
-Why a separate script (not part of the smoke / verify ones)
------------------------------------------------------------
-- `_smoke_test` (in contextvae_inference.py) only verifies shape and
-  magnitude on synthetic input — no map registration, no visualization.
-- `verify_inference.py` checks numerical agreement with ground truth on
-  a real val sample but doesn't render anything visual.
-- This script closes the loop: if the homography, ego-frame rotation, or
-  K-mean collapse is wrong DIRECTIONALLY, the predicted dots will land
-  off-road or pointing backward, which a one-glance image inspection
-  catches immediately. Numerical-only tests can miss directional bugs
-  that happen to land in the right magnitude.
+Why a separate script
+---------------------
+The smoke test checks only shape/magnitude on synthetic input, and
+`verify_inference.py` checks numbers but renders nothing. This closes the loop:
+a directional bug in the homography, ego-frame rotation, or K-mean collapse
+makes the predicted dots land off-road or point backward — obvious at a glance,
+but invisible to a numbers-only test if the magnitude happens to be plausible.
 
 Run via
 -------
     python uav_guidance/server_code_only/main_program/visual_sanity.py
-
-Output
-------
-    Writes `tmp/contextvae_visual_sanity.png` (relative to the repo root).
+    # writes tmp/contextvae_visual_sanity.png (relative to the repo root)
 """
 
 import os
 import sys
 
 import numpy as np
-# We use PIL instead of cv2 because the contextvae conda env
-# (`new_xupei_env`) does NOT ship OpenCV — that dependency lives in the
-# server's own conda env, not the training env. PIL is part of the
-# training env and is enough for offline overlay rendering. The real
-# server file (`scene_recog_socket_yolov8.py`) still uses cv2 because it
-# runs under the SERVER env where OpenCV is available.
+# PIL rather than cv2: this offline overlay runs under the training conda env,
+# which ships PIL but not OpenCV. The live server file still uses cv2 (it runs
+# under the server env where OpenCV is available).
 from PIL import Image, ImageDraw, ImageFont
 
-# Pull in the helper modules. Each lives alongside this script.
+# Sibling helper modules live alongside this script.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
@@ -74,10 +57,8 @@ from verify_inference import (  # noqa: E402
 def main() -> None:
     val_txt = os.path.join(_REPO_ROOT, "data", "levelx", "val", "inD_01.txt")
     map_pickle = os.path.join(_REPO_ROOT, "data", "levelx", "map", "inD_01.pkl")
-    # The un-padded background — the same image the preprocessing notebook
-    # started from before adding the EXT_PAD=202 border of -1.0. This is
-    # what we ASSUME the UAV's video stream would show in a Day 1-2
-    # stationary replay.
+    # The un-padded background (before the EXT_PAD border) — what a stationary
+    # replay assumes the UAV stream shows.
     bg_path = os.path.join(_REPO_ROOT, "levelx", "inD", "data", "01_background.png")
     ckpt = os.path.join(_REPO_ROOT, "tmp", "levelx_full_map_v1", "ckpt-best")
     cfg = os.path.join(_REPO_ROOT, "configs", "levelx_train.py")
@@ -86,8 +67,7 @@ def main() -> None:
     print(f"[viz] loading bg : {bg_path}")
     if not os.path.exists(bg_path):
         raise FileNotFoundError(f"Background image not found: {bg_path}")
-    # PIL gives us (W, H) from .size; we keep it as a PIL Image to draw
-    # onto via ImageDraw, then save as PNG at the end.
+    # Keep as a PIL Image to draw on via ImageDraw; .size is (W, H).
     img = Image.open(bg_path).convert("RGB")
     draw = ImageDraw.Draw(img)
     print(f"[viz] bg size    : {img.size}")  # (W, H)
@@ -106,9 +86,8 @@ def main() -> None:
     neighbors = _collect_neighbors(frame_ids, target_aid, frames_to_rows)
     print(f"[viz] neighbors  : {len(neighbors)}")
 
-    # Inferencer + shim. Pin map_model to resnet18 to match the
-    # headline checkpoint (independent of the local config's current
-    # ablation toggles).
+    # Pin map_model to resnet18 to match the headline checkpoint regardless of
+    # the config file's current contents.
     inf = ContextVAEInferencer(
         ckpt_path=ckpt,
         config_path=cfg,
@@ -117,19 +96,17 @@ def main() -> None:
     )
     shim = PixelMetricShim(map_pickle)
 
-    # Inference. Pass the stored heading (radians, world frame) at the first
-    # obs frame — same value the training-time loader reads from
-    # contextvae/data.py:468. Without this the inferencer falls back to an
-    # atan2 finite-diff of (target[1]-target[0]) and emits a one-shot warning;
-    # the visual would then show a map crop rotated by velocity direction
-    # instead of vehicle heading, biasing the prediction overlay.
+    # Pass the stored first-obs-frame heading (radians, world frame), matching
+    # the training loader. Omitting it falls back to an atan2 finite-diff,
+    # rotating the crop by velocity direction rather than vehicle heading and
+    # biasing the overlay.
     pred_metric = inf.infer(
         target_history, neighbors, heading_world=target_heading_world,
     )  # (6, 2) metric world
     print(f"[viz] pred metric:\n{pred_metric}")
 
-    # Project everything to pixel coords for drawing.
-    # Each is shape (N, 2) with columns [u (col), v (row)] in un-padded pixels.
+    # Project everything to pixels for drawing: (N, 2) columns [u=col, v=row],
+    # un-padded.
     hist_uv = shim.metrics_to_pixel(target_history)
     gt_uv = shim.metrics_to_pixel(target_future_gt[:PROTOCOL_FUTURE_STEPS])
     pred_uv = shim.metrics_to_pixel(pred_metric)
@@ -141,9 +118,7 @@ def main() -> None:
     def _draw_dots(arr_uv, color, radius=4):
         for u, v in arr_uv:
             ui, vi = int(round(u)), int(round(v))
-            # PIL's ellipse takes a bounding box. ImageDraw silently
-            # clips coords that fall outside the image, so we don't
-            # need to bounds-check explicitly.
+            # ImageDraw clips off-image coords, so no explicit bounds check.
             draw.ellipse(
                 (ui - radius, vi - radius, ui + radius, vi + radius),
                 fill=color,
@@ -153,9 +128,7 @@ def main() -> None:
     _draw_dots(gt_uv, (255, 255, 0), radius=4)
     _draw_dots(pred_uv, (255, 0, 0), radius=4)
 
-    # Trace each sequence with a polyline so the temporal order is visible
-    # at a glance. PIL's line takes a flat list of [x0, y0, x1, y1, ...]
-    # tuples — we pass an iterable of (x, y) which works equivalently.
+    # Trace each sequence with a polyline so temporal order is visible.
     def _polyline(arr_uv, color, width=2):
         pts = [(int(round(u)), int(round(v))) for u, v in arr_uv]
         draw.line(pts, fill=color, width=width)
@@ -164,8 +137,7 @@ def main() -> None:
     _polyline(gt_uv, (200, 200, 0))
     _polyline(pred_uv, (200, 0, 0))
 
-    # Legend box. Default PIL font (no font file needed) is small but
-    # adequate for a sanity-check overlay.
+    # Legend box with the default PIL font (small but adequate here).
     draw.rectangle((10, 10, 260, 90), fill=(255, 255, 255))
     try:
         font = ImageFont.load_default()

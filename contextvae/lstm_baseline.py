@@ -3,43 +3,33 @@ import torch.nn as nn
 
 
 class LSTMBaseline(nn.Module):
-    """Faithful port of Ntousis' `tr_pred_lstm` adapted to ContextVAE's data interface.
+    """Faithful port of Ntousis' LSTM trajectory predictor (tr_pred_lstm),
+    adapted to ContextVAE's data interface to serve as a head-to-head baseline.
 
-    Original (uav_guidance, commit ce91bae, scene_recog_socket_yolov8.py:30-39):
-
-        class tr_pred_lstm(nn.Module):
-            def __init__(self, out_steps):
-                super().__init__()
-                self.lstm   = nn.LSTM(input_size=10, hidden_size=64, batch_first=True)
-                self.linear = nn.Linear(64, out_steps*2)
-            def forward(self, x):
-                x, _ = self.lstm(x); x = self.linear(x); return x
-
-    Architectural choices preserved 1:1:
+    Original architecture, preserved 1:1:
       - LSTM input_size=10, hidden_size=64, single layer, batch_first=True
       - Linear head: hidden_dim -> out_steps*2 (interleaved [x1,y1,...,xm,ym])
-      - Linear is applied to ALL timesteps; the prediction is `out[..., -1, :]`
-        (cf. scene_recog_socket_yolov8.py:588 `track_predict_model(...)[-1,:]`)
+      - the linear runs on every timestep; the prediction is the last-timestep
+        projection, out[..., -1, :]
 
-    Per-timestep 10-D input layout (cf. find_neighbors_from_detections at line 380):
+    Per-timestep 10-D input layout:
 
         [up_x, up_y, left_x, left_y, target_x, target_y, right_x, right_y, down_x, down_y]
 
-    Quadrants follow Ntousis' detect_up/down/left/right partition of the (rel_x, rel_y)
-    plane by the y=x and y=-x diagonals (lines 40-90). In ContextVAE's agent-centered
-    heading-rotated metric frame the visual labels "up"/"down" do not literally agree
-    with Ntousis' pixel-space +y-down convention, but the 4-quadrant partition is the
-    same — what matters for the LSTM is the consistent feature layout.
+    Quadrants follow Ntousis' up/down/left/right partition of the (rel_x, rel_y)
+    plane along the y=x and y=-x diagonals. In ContextVAE's agent-centered,
+    heading-rotated metric frame the labels "up"/"down" no longer match his
+    pixel-space +y-down convention, but the 4-quadrant partition is identical —
+    what matters for the LSTM is a consistent feature layout.
 
-    Adaptations vs. the deployed Ntousis pipeline (all locked thesis decisions):
-      - out_steps = PRED_HORIZON = 25 (5 s @ 5 Hz) instead of his 6, so eval matches
-        ContextVAE's protocol head-to-head.
-      - Inputs are raw metric coords (NO min-max scaling). See thesis_plan.md:114.
-      - Neighbor source is the radius-masked, 1e9-padded `neighbor` tensor from
-        contextvae/data.py — not the per-frame 4-direction pixel lookup. The
-        quadrant assignment is computed at every observation timestep from those
-        per-step neighbor positions, then fed to the LSTM as a 10-D stream.
-      - Empty-quadrant fallback is (0, 0), matching Ntousis' `min_track=[0,0]`.
+    Adaptations (locked thesis decisions):
+      - out_steps = PRED_HORIZON = 25 (5 s @ 5 Hz) instead of 6, so evaluation
+        matches ContextVAE's protocol head-to-head.
+      - Inputs are raw metric coordinates (no min-max scaling).
+      - Neighbors come from the radius-masked, 1e9-padded `neighbor` tensor
+        (contextvae/data.py), not a per-frame 4-direction pixel lookup; the
+        quadrant assignment is recomputed at every observation timestep.
+      - Empty-quadrant fallback is (0, 0), matching Ntousis' min_track=[0, 0].
     """
 
     PAD_THRESHOLD = 1e8  # neighbor positions >= this come from the loader's 1e9 padding
@@ -71,7 +61,7 @@ class LSTMBaseline(nn.Module):
         rel_y = ny - ty.unsqueeze(-1)
         abs_rx = rel_x.abs()
         abs_ry = rel_y.abs()
-        # Quadrant masks (Ntousis verbatim — see lines 40-90):
+        # Quadrant masks, following Ntousis' up/down/left/right partition.
         up_mask    = (rel_y <= -abs_rx)
         down_mask  = (rel_y >=  abs_rx)
         left_mask  = (rel_x <  -abs_ry)

@@ -1,13 +1,13 @@
-"""Verify every data/levelx/map/*.pkl matches the contract contextvae/data.py expects.
+"""Verify every data/levelx/map/*.pkl matches the map contract the loader expects.
 
-Contract (from contextvae/data.py:461-469 and :289-297):
+Contract (as consumed by contextvae/data.py):
     pickle payload = (semantic_map, H)
     semantic_map : np.ndarray, dtype float32, shape (3, H, W), values in [-1.0, 1.0]
     H            : np.ndarray, dtype float64, shape (3, 3), bottom row [0, 0, 1],
-                   2x2 leading block invertible (det != 0)
+                   with an invertible 2x2 leading block (det != 0)
 
-Also cross-checks that every map referenced by data/levelx/{train,val}/*.info has
-a corresponding .pkl on disk.
+Also cross-checks that every map referenced by data/levelx/{train,val}/*.info
+has a corresponding .pkl on disk, so training never fails on a dangling link.
 
 Run:
     python tests/verify_levelx_maps.py
@@ -21,7 +21,6 @@ from pathlib import Path
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-# print(REPO_ROOT)
 MAP_DIR = REPO_ROOT / "data" / "levelx" / "map"
 TRAIN_DIR = REPO_ROOT / "data" / "levelx" / "train"
 VAL_DIR = REPO_ROOT / "data" / "levelx" / "val"
@@ -40,7 +39,7 @@ def check_pkl(path: Path) -> list[str]:
 
     sm, H = payload
 
-    # semantic_map checks
+    # semantic_map: must be a float32 (3, H, W) tensor normalized to [-1, 1].
     if not isinstance(sm, np.ndarray):
         errs.append(f"semantic_map is not np.ndarray (got {type(sm).__name__})")
     else:
@@ -55,7 +54,7 @@ def check_pkl(path: Path) -> list[str]:
             if mn < -1.0 - 1e-6 or mx > 1.0 + 1e-6:
                 errs.append(f"semantic_map out of [-1, 1] (min={mn:.4f}, max={mx:.4f})")
 
-    # H checks
+    # H: must be a float64 3x3 affine homography that the loader can invert.
     if not isinstance(H, np.ndarray):
         errs.append(f"H is not np.ndarray (got {type(H).__name__})")
     else:

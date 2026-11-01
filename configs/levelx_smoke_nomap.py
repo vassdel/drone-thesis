@@ -1,8 +1,8 @@
-# Smoke-test config — no-map S-ATTN-only baseline.
-# Inherits everything from levelx_train.py (which already sets map_model=None),
-# then trims epochs to 1 so a 2-recording smoke run finishes in minutes.
+# levelX smoke test — no-map S-ATTN-only baseline.
+# Inherits levelx_train.py (which sets map_model=None) and trims epochs to 1 so
+# a small smoke run finishes in minutes.
 #
-# Run from the repo root in the `new_xupei_env` conda env:
+# Run from the repo root:
 #
 #   python -m contextvae.main \
 #       --train data/levelx/train \

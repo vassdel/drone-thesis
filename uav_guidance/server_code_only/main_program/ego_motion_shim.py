@@ -1,37 +1,29 @@
 """
-Moving-camera pixel <-> metric world conversion (Week 3 Day 2-4).
+Moving-camera pixel <-> metric world conversion (ego-motion compensation).
 
-Drop-in replacement for `PixelMetricShim` when the UAV is moving rather
-than hovering. Implements the same four-method API
-(`pixel_to_metric` / `metric_to_pixel` / `pixels_to_metric` /
-`metrics_to_pixel`), plus ONE new lifecycle method:
+Drop-in replacement for `PixelMetricShim` when the UAV is moving rather than
+hovering. Implements the same four-method API plus one lifecycle method:
 
     status = shim.update_frame(frame_bgr, mask_bboxes_ltwh=None)
 
-`update_frame` must be called once per video frame (after YOLO detection so
-the bbox-mask is ready, before any pixel <-> metric calls for that frame).
-It estimates the homography `H_live -> K0` (current frame to canonical
-keyframe-zero pixel space) via ORB keypoints + USAC_MAGSAC, then composes
-that with the static `H_K0 -> world` from the orthomap pickle that
-`PixelMetricShim` already exposes.
+Call `update_frame` once per video frame (after detection so the bbox mask is
+ready, before any pixel<->metric calls for that frame). It estimates the
+homography H_live -> K0 (current frame to canonical keyframe-zero pixel space)
+via ORB keypoints + USAC_MAGSAC, then composes it with the static H_K0 ->
+world from the base shim.
 
-Reference-frame strategy: frame-to-keyframe with sliding re-anchoring
-(NOT pairwise — drifts catastrophically — and NOT fixed-K0 — breaks when
-the UAV pans away from the original view). We re-anchor to a new keyframe
-when match quality degrades; the chain `H_Kc -> K0` is updated once per
-re-anchor, capping accumulated multiplications at ~10 over a 30 s clip.
+Reference-frame strategy: frame-to-keyframe with sliding re-anchoring. Pairwise
+chaining drifts catastrophically; a fixed K0 breaks once the UAV pans away from
+the original view. Instead we re-anchor to a fresh keyframe when match quality
+degrades, keeping the number of chained multiplications small over a clip.
 
-Best-practice parameters (see plan's best-practices report):
-  - Detector: ORB nfeatures=3000 (binary, SIMD-fast on Hamming distance)
-  - Matcher : BFMatcher(NORM_HAMMING) + KNN k=2 + Lowe ratio 0.75
-  - RANSAC  : cv2.USAC_MAGSAC, ransacReprojThreshold=3.0 (OpenCV's current
-              recommendation; dataset-invariant threshold; requires cv2 >= 4.5.2)
-  - Reject if inliers < 50 OR inlier_ratio < 0.4 -> status FROZEN
-  - Re-anchor if inliers < 150 OR translation > 40% width
+Detector / matcher / RANSAC: ORB + BFMatcher(NORM_HAMMING) + KNN k=2 + Lowe
+ratio, with USAC_MAGSAC for the homography fit. Tuned values are in the module
+constants below; they require cv2 >= 4.5.2 for USAC_MAGSAC.
 
 Public API contract (mirrors PixelMetricShim):
     shim = MovingCameraShim(map_pickle_path)
-    shim.update_frame(frame_bgr, mask_bboxes_ltwh=[...])   # NEW, per frame
+    shim.update_frame(frame_bgr, mask_bboxes_ltwh=[...])   # per frame
     x_m, y_m = shim.pixel_to_metric(u, v)
     u, v     = shim.metric_to_pixel(x_m, y_m)
     xy_m  = shim.pixels_to_metric(uv_array)    # (N, 2) -> (N, 2)
@@ -46,12 +38,11 @@ import numpy as np
 from pixel_metric_shim import PixelMetricShim
 
 
-# Detector / matcher / RANSAC knobs — see module docstring for sources.
-# nfeatures bumped from the 3000 baseline to 5000 because after masking
-# moving agents + Lowe ratio + RANSAC inlier removal we want >=200 clean
-# inliers for tight homography fits; RANSAC reproj threshold 1.5 px keeps
-# the fit tight enough that 7-grid corner lever-arm amplification stays
-# under ~3 px (USAC_MAGSAC has dataset-invariant threshold semantics).
+# Detector / matcher / RANSAC knobs.
+# nfeatures=5000 (vs a 3000 baseline): after masking moving agents, the Lowe
+# ratio test, and RANSAC inlier removal, we still want >=200 clean inliers for
+# a tight fit. A 1.5 px reproj threshold keeps corner lever-arm error under
+# ~3 px (USAC_MAGSAC uses a dataset-invariant threshold).
 _ORB_DEFAULTS = dict(
     nfeatures=5000, scaleFactor=1.2, nlevels=8,
     edgeThreshold=31, fastThreshold=20, patchSize=31,
@@ -64,15 +55,12 @@ _RANSAC_CONFIDENCE = 0.999
 _MIN_INLIERS_OK = 50
 _MIN_INLIER_RATIO = 0.4
 _REANCHOR_TRANSLATION_FRAC = 0.40         # of frame width
-# Quality-based re-anchor: when the live->Kc inlier ratio drops below
-# this floor, promote Kc to a fresher frame. Without this trigger, on
-# real UAV footage Kc stays pinned to the first frame even as the
-# camera slowly pans, the match quality decays linearly, and somewhere
-# around 30-40 frames the per-frame fit starts failing the
-# _MIN_INLIER_RATIO=0.4 acceptance gate — flipping 80%+ of frames to
-# FROZEN. Translation alone can't catch this (the camera might not have
-# translated 40% of frame width even when match quality has tanked).
-# 0.55 leaves a comfortable margin above the acceptance gate.
+# Quality-based re-anchor floor: promote Kc to a fresher frame when the
+# live->Kc inlier ratio drops below this. On a slowly panning camera the
+# match quality against a pinned keyframe decays into the _MIN_INLIER_RATIO
+# acceptance gate long before translation reaches 40% of frame width, so
+# without this trigger most frames would go FROZEN. 0.55 keeps a comfortable
+# margin above the 0.4 gate.
 _REANCHOR_INLIER_RATIO_FLOOR = 0.55
 _DILATE_FRAC = 0.18                       # of max(bbox_w, bbox_h)
 _DILATE_MIN_PX = 20
@@ -82,10 +70,9 @@ class MovingCameraShim:
     """
     Stateful pixel <-> metric converter for moving-UAV footage.
 
-    Internally composes a `PixelMetricShim` for the static K0 -> world step.
-    The per-frame estimated `H_live -> K0` is cached after every
-    `update_frame` call; the four conversion methods are then O(1) homography
-    applies (just like `PixelMetricShim`).
+    Composes a static base shim (PixelMetricShim or ScaleOnlyShim) for the
+    K0 -> world step. Each `update_frame` caches the per-frame estimate
+    H_live -> K0; the four conversion methods are then O(1) homography applies.
     """
 
     def __init__(
@@ -97,19 +84,14 @@ class MovingCameraShim:
         **detector_kwargs,
     ):
         if detector != "ORB":
-            # AKAZE fallback is in the deferred-scope list (see plan); ORB-only
-            # for the Week 3 MVP. Raise loudly rather than silently downgrade.
+            # Only ORB is implemented; raise rather than silently downgrade.
             raise NotImplementedError(
                 f"detector={detector!r} not supported; ORB only for now."
             )
-        # Construct the static K0->world base shim. Two paths:
-        #   - `map_pickle_path` given -> wrap a fresh `PixelMetricShim`.
-        #     This is the original synth-clip / inD/uniD / rounD code path.
-        #   - `base_shim` given       -> use the caller's pre-built shim
-        #     (e.g. `ScaleOnlyShim` for VisDrone or any other dataset that
-        #     ships no homography). The caller's object MUST implement the
-        #     four-method API; we duck-type rather than check explicitly.
-        # Exactly one must be supplied; supplying both is ambiguous.
+        # Static K0->world base shim. Supply exactly one of:
+        #   - map_pickle_path -> wrap a fresh PixelMetricShim (inD/uniD/rounD);
+        #   - base_shim       -> a caller-built four-method shim (e.g.
+        #     ScaleOnlyShim for VisDrone). Duck-typed, not checked explicitly.
         if base_shim is not None and map_pickle_path is not None:
             raise ValueError(
                 "MovingCameraShim: specify exactly one of `map_pickle_path` "
@@ -128,12 +110,11 @@ class MovingCameraShim:
         self._orb = cv2.ORB_create(**orb_kwargs)
         self._bf = cv2.BFMatcher(cv2.NORM_HAMMING)
 
-        # Keyframe state. All set lazily on first update_frame().
-        # We keep K0's keypoints/descriptors PERMANENTLY (separate from Kc)
-        # so that at re-anchor time we can refit `H_K_new -> K0` by direct
-        # match against K0 — avoids the cascading drift that pure-chain
-        # re-anchoring produces. Kc is the current keyframe used for the
-        # per-frame `H_live -> Kc` fit.
+        # Keyframe state, set lazily on first update_frame(). K0's
+        # keypoints/descriptors are kept permanently (separate from Kc) so a
+        # re-anchor can refit H_Knew -> K0 by matching directly against K0,
+        # avoiding the cascading drift of pure-chain re-anchoring. Kc is the
+        # current keyframe used for the per-frame H_live -> Kc fit.
         self._kp_K0: Optional[List[cv2.KeyPoint]] = None
         self._des_K0: Optional[np.ndarray] = None
         self._kp_Kc: Optional[List[cv2.KeyPoint]] = None
@@ -177,13 +158,11 @@ class MovingCameraShim:
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         kp_live, des_live = self._orb.detectAndCompute(gray, kp_mask)
 
-        # Bootstrap: this frame IS K0 (and also the first Kc).
+        # Bootstrap: this frame IS K0 (and the first Kc).
         if self._kp_Kc is None:
             if des_live is None or len(kp_live) < _MIN_GOOD_MATCHES:
-                # We can still accept it as K0 — there's nothing to match
-                # against. The conversion methods just won't work well on
-                # later frames if there are too few features. For now,
-                # accept silently.
+                # Accept as K0 regardless — there is nothing to match against
+                # yet. Too few features here only hurts later-frame fits.
                 pass
             self._kp_K0 = kp_live
             self._des_K0 = des_live
@@ -202,8 +181,8 @@ class MovingCameraShim:
             self.n_frozen += 1
             return "FROZEN"
 
-        # Fit H_live -> Kc (current keyframe). This is the per-frame fit
-        # that drives both the conversion API and the re-anchor decision.
+        # Per-frame fit H_live -> Kc; drives both the conversion API and the
+        # re-anchor decision.
         H_live_to_Kc, n_inliers_Kc, n_good_Kc = self._fit_homography(
             kp_live, des_live, self._kp_Kc, self._des_Kc,
         )
@@ -219,17 +198,14 @@ class MovingCameraShim:
             @ H_live_to_Kc.astype(np.float64)
         )
 
-        # Two re-anchor triggers, EITHER fires:
-        #   (1) translation > 40 % frame width — coarse "we have drifted a
-        #       lot" signal, originally the only trigger.
-        #   (2) live->Kc inlier ratio dropped below the quality floor —
-        #       catches slow pans where translation never reaches 40% W but
-        #       match quality decays into the rejection-gate floor (0.4).
-        #       Without (2), the shim freezes on long natural-pan clips
-        #       (e.g. VisDrone uav0000305_00000_v: 86 % FROZEN without (2)
-        #       even though scene features are abundant).
-        # We DELIBERATELY do not trigger on absolute inlier COUNT: that
-        # oscillates near the gate and produces re-anchor cascades.
+        # Re-anchor if EITHER trigger fires:
+        #   (1) translation > 40% frame width — coarse "drifted a lot" signal;
+        #   (2) live->Kc inlier ratio below the quality floor — catches slow
+        #       pans where translation stays under 40% W but match quality
+        #       decays into the rejection gate, which would otherwise freeze
+        #       most frames on long natural-pan clips.
+        # We deliberately do NOT trigger on absolute inlier count: it
+        # oscillates near the gate and causes re-anchor cascades.
         translation_mag = float(
             np.hypot(H_live_to_Kc[0, 2], H_live_to_Kc[1, 2])
         )
@@ -239,10 +215,9 @@ class MovingCameraShim:
         )
 
         if do_reanchor:
-            # Critical: refit `H_new_Kc -> K0` directly against K0
-            # descriptors (which we kept around at __init__). Falling back
-            # to the chained `H_live_to_K0` would bake in the per-frame
-            # RANSAC noise and amplify it on every subsequent re-anchor.
+            # Refit H_newKc -> K0 directly against K0's descriptors (kept since
+            # init) rather than reuse the chained estimate, which would bake in
+            # per-frame RANSAC noise and amplify it on each re-anchor.
             H_new_Kc_to_K0, _, _ = self._fit_homography(
                 kp_live, des_live, self._kp_K0, self._des_K0,
             )
@@ -250,8 +225,8 @@ class MovingCameraShim:
                 self._H_Kc_to_K0 = H_new_Kc_to_K0
                 H_live_to_K0 = H_new_Kc_to_K0   # current frame == new Kc
             else:
-                # K0 has drifted too far out of view; accept the chained
-                # estimate as the new anchor (with its accumulated error).
+                # K0 out of view; fall back to the chained estimate (with its
+                # accumulated error) as the new anchor.
                 self._H_Kc_to_K0 = H_live_to_K0.copy()
             self._kp_Kc = kp_live
             self._des_Kc = des_live
@@ -356,7 +331,7 @@ class MovingCameraShim:
 
     def pixel_to_metric(self, u: float, v: float) -> Tuple[float, float]:
         self._require_initialized()
-        # live (u, v) -> K0 (u', v')
+        # live (u, v) -> K0, then K0 -> world via the base shim.
         p = self._H_live_to_K0 @ np.array([u, v, 1.0], dtype=np.float64)
         if abs(p[2]) < 1e-12:
             raise RuntimeError(

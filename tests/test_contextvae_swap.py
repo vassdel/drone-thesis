@@ -1,13 +1,13 @@
-"""Lightweight wiring test for LSTM->ContextVAE swap (2026-05-12).
+"""Wiring test for the LSTM-to-ContextVAE predictor swap.
 
-Validates that the swap done in
+Validates that the server-side predictor in
 `uav_guidance/server_code_only/main_program/scene_recog_socket_yolov8.py`
-is still in place: the new modules import cleanly, expose the documented
-public API and constants, the pixel<->metric shim round-trips, and the
-server file is still wired to ContextVAEInferencer.infer (not to the
-removed LSTM predictor).
+is wired to ContextVAE: the new modules import cleanly, expose the
+documented public API and constants, the pixel/metric shim round-trips,
+and the server file calls ContextVAEInferencer.infer rather than the
+removed LSTM predictor.
 
-Heavy checks (real ckpt, ADE/FDE, PNG overlay) live next to the swap:
+Heavy checks (real checkpoint, ADE/FDE, PNG overlay) live next to the swap:
   - uav_guidance/server_code_only/main_program/verify_inference.py
   - uav_guidance/server_code_only/main_program/visual_sanity.py
 
@@ -28,8 +28,8 @@ MAP_PICKLE = REPO_ROOT / "data" / "levelx" / "map" / "inD_01.pkl"
 VAL_TXT = REPO_ROOT / "data" / "levelx" / "val" / "inD_01.txt"
 SERVER_FILE = SWAP_DIR / "scene_recog_socket_yolov8.py"
 
-# main_program/ has no __init__.py, so the three swap modules can't be
-# imported as a package. Inject the directory onto sys.path.
+# main_program/ has no __init__.py, so the swap modules can't be imported
+# as a package; put the directory on sys.path to import them by name.
 sys.path.insert(0, str(SWAP_DIR))
 
 
@@ -98,8 +98,8 @@ def check_shim_roundtrip() -> bool:
 
     shim = PixelMetricShim(str(MAP_PICKLE))
 
-    # Pull a real in-map (x, y) from row 0 of the val recording.
-    # File format: fid aid x y heading group
+    # Use a real in-map (x, y) from row 0 of the val recording as the
+    # round-trip probe. Row format: fid aid x y heading group.
     first_row = next(
         (ln for ln in VAL_TXT.read_text().splitlines() if ln.strip()),
         None,
@@ -113,7 +113,7 @@ def check_shim_roundtrip() -> bool:
         return False
     xy = np.array([float(toks[2]), float(toks[3])], dtype=np.float64)
 
-    # Single-point round-trip.
+    # Single-point round-trip must recover the input to 1e-6 m.
     u, v = shim.metric_to_pixel(*xy)
     x2, y2 = shim.pixel_to_metric(u, v)
     err = float(np.hypot(x2 - xy[0], y2 - xy[1]))
@@ -123,7 +123,7 @@ def check_shim_roundtrip() -> bool:
         print(f"  FAIL: single round-trip error {err:.2e} m exceeds 1e-6")
         return False
 
-    # Batch round-trip on three nearby points.
+    # Batch round-trip on three nearby points exercises the vectorized path.
     xy_batch = np.array([xy, xy + [1.0, 0.0], xy + [0.0, 1.0]], dtype=np.float64)
     uv_batch = shim.metrics_to_pixel(xy_batch)
     xy_back = shim.pixels_to_metric(uv_batch)
@@ -137,12 +137,11 @@ def check_shim_roundtrip() -> bool:
 
 
 def check_call_site_regression() -> bool:
-    """Confirm scene_recog_socket_yolov8.py still imports the swap modules
-    and calls .infer(...), and does NOT import the removed LSTM module.
+    """Confirm scene_recog_socket_yolov8.py imports the swap modules and
+    calls .infer(...), and does not import the removed LSTM module.
 
-    Uses ast so the comment block in scene_recog_socket_yolov8.py that
-    documents the LSTM removal (and mentions `tr_pred_lstm` by name)
-    does not false-positive."""
+    Parses the AST (not text) so that a comment in the server file naming
+    `tr_pred_lstm` cannot false-positive the removed-import check."""
     print("=== check_call_site_regression ===")
     if not SERVER_FILE.exists():
         print(f"  missing server file: {SERVER_FILE}")
@@ -154,8 +153,8 @@ def check_call_site_regression() -> bool:
         print(f"  ast.parse failed: {e!r}")
         return False
 
-    from_imports = {}      # module -> set of imported names
-    plain_imports = set()  # `import foo` / `import foo.bar`
+    from_imports = {}      # module -> set of names from `from X import ...`
+    plain_imports = set()  # module names from `import X`
     infer_calls = 0
 
     for node in ast.walk(tree):

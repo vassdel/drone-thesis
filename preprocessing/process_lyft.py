@@ -15,26 +15,29 @@ from l5kit.rasterization.semantic_rasterizer import INTERPOLATION_POINTS, cv2_su
 from l5kit.rasterization.rasterizer import EGO_EXTENT_HEIGHT, EGO_EXTENT_LENGTH, EGO_EXTENT_WIDTH
 import cv2
 
-# 8.44GB 8.2GB 2.86MB
+# Lyft Level-5 Prediction -> ContextVAE on-disk format. Emits per-scene
+# <host>-<start>-<end>.txt trajectory rows and a single rasterized semantic map
+# map/overall-map.pkl = (semantic_map [3,H,W] in [-1,1], H 3x3). Scenes are
+# sharded into --split groups for distributed training. The native 10 Hz data
+# is downsampled by --frameskip (2 -> 5 Hz to match the nuScenes setup).
 #
-# conda create -n lyft
-# conda activate lyft
-# conda install python=3.9
-# pip install l5kit==1.5.0
-# pip install opencv-python
+# Environment:
+#   conda create -n lyft && conda activate lyft
+#   conda install python=3.9
+#   pip install l5kit==1.5.0 opencv-python
 #
-# mkdir dataset
-# mkdir dataset/train
-# mkdir dataset/validate
-# mkdir dataset/semantic_map
-# wget https://lyft-l5-datasets-public.s3-us-west-2.amazonaws.com/prediction/v1.1/train.tar
-# wget https://lyft-l5-datasets-public.s3-us-west-2.amazonaws.com/prediction/v1.1/validate.tar
-# wget https://lyft-l5-datasets-public.s3-us-west-2.amazonaws.com/prediction/v1.1/semantic_map.tar
-
-# tar -xf train.tar -C dataset/train
-# tar -xf validate.tar -C dataset/validate
-# tar -xf semantic_map.tar -C dataset/semantic_map
-# python lyft.py dataset 5FPS --frameskip 2 --fraction 4
+# Data download and extraction (train.tar 8.44 GB, validate.tar 8.2 GB,
+# semantic_map.tar 2.86 MB):
+#   mkdir -p dataset/train dataset/validate dataset/semantic_map
+#   wget https://lyft-l5-datasets-public.s3-us-west-2.amazonaws.com/prediction/v1.1/train.tar
+#   wget https://lyft-l5-datasets-public.s3-us-west-2.amazonaws.com/prediction/v1.1/validate.tar
+#   wget https://lyft-l5-datasets-public.s3-us-west-2.amazonaws.com/prediction/v1.1/semantic_map.tar
+#   tar -xf train.tar -C dataset/train
+#   tar -xf validate.tar -C dataset/validate
+#   tar -xf semantic_map.tar -C dataset/semantic_map
+#
+# Run:
+#   python process_lyft.py dataset 5FPS --frameskip 2 --split 4
 
 
 import argparse
@@ -57,6 +60,10 @@ MAP_PATH = os.path.join(settings.data_root, settings.map_folder, "semantic_map.p
 DATASET_META = os.path.join(settings.data_root, settings.map_folder, "meta.json")
 
 EGO_EXTENT = np.asarray((EGO_EXTENT_LENGTH, EGO_EXTENT_WIDTH, EGO_EXTENT_HEIGHT))
+
+# Convert one scene's frames into a .txt trajectory file and return the agents'
+# world bounding box (x_min, x_max, y_min, y_max) for later map sizing, or None
+# if the scene yields no multi-frame tracks.
 def generate(dataset, host, start_frame, end_frame, path):
     name = "{}-{}-{}".format(host, start_frame, end_frame)
 
@@ -77,7 +84,7 @@ def generate(dataset, host, start_frame, end_frame, path):
         if need_record:
             R = frame["ego_rotation"]
             singular = (R[0][0]*R[0][0] + R[1][1]*R[1][1])**0.5 < 1e-6
-            heading = 0 if singular else np.arctan2(R[1][0], R[0][0]) # yaw
+            heading = 0 if singular else np.arctan2(R[1][0], R[0][0])  # yaw from rotation matrix
             agent_id = 0
             agent_type = "EGO"
             if agent_id not in agents: agents[agent_id] = []
@@ -87,6 +94,8 @@ def generate(dataset, host, start_frame, end_frame, path):
             prob = agent["label_probabilities"]
             agent_type = np.argmax(prob)
             agent_type = "_".join(PERCEPTION_LABELS[agent_type].split("_")[2:])
+            # Collapse all four-wheeled classes to VEHICLE; keep listed VRU
+            # classes as-is; drop anything else (unknown/debris).
             if agent_type in ["CAR", "BUS", "VAN", "TRUCK", "EMERGENCY_VEHICLE", "OTHER_VEHICLE"]:
                 agent_type = "VEHICLE"
             elif agent_type not in [
@@ -102,9 +111,11 @@ def generate(dataset, host, start_frame, end_frame, path):
             extent = agent["extent"]
             track_id = agent["track_id"]
 
-            # filter vehicles for prediction in the same way with lyft dataset
-            # https://github.com/woven-planet/l5kit/blob/71eb4dae2c8230f7ca2c60e5b95473c91c715bb8/l5kit/l5kit/dataset/select_agents.py#L76
-            tracked = track_id in tracks and tracks[track_id] is not None 
+            # Replicate l5kit's agent-quality filtering (select_agents.py):
+            # tag low-confidence or far-away detections "_IGNORE", and break the
+            # track on a frame gap or a large yaw/extent jump so a re-detection
+            # starts a fresh agent id.
+            tracked = track_id in tracks and tracks[track_id] is not None
             lost = False
             if max(prob) < 0.5:
                 agent_type += "_IGNORE"
@@ -115,7 +126,7 @@ def generate(dataset, host, start_frame, end_frame, path):
             if not tracked or fid - tracks[track_id][1][0] != 1 or \
             not in_angular_distance(tracks[track_id][1][1], heading, TH_YAW_DEGREE) or \
             not in_extent_ratio(tracks[track_id][1][2], extent, TH_EXTENT_RATIO):
-                # lose track, consider the current agent as a new agent
+                # Track broken: treat the current detection as a new agent.
                 agent_id = None
             else:
                 agent_id = tracks[track_id][0]
@@ -130,6 +141,8 @@ def generate(dataset, host, start_frame, end_frame, path):
                 tracks[track_id] = None
             else:
                 tracks[track_id] = agent_id, (fid, heading, extent)
+    # Emit one row per (agent, frame); extent and track_id are kept for debugging
+    # but the loader only needs fid/aid/x/y/heading/group.
     content = []
     x, y = [], []
     for agent_id, record in agents.items():
@@ -174,8 +187,9 @@ if __name__ == "__main__":
         rem = n_scenes % settings.split
         e, batch = 0, 0
         target_folder = settings.target_folder
+        # Assign scenes to --split shards in contiguous, near-equal batches.
         for i, scene in enumerate(scenes):
-            if i == e: 
+            if i == e:
                 s = e
                 e = s + n + (1 if batch < rem else 0)
                 batch += 1
@@ -212,6 +226,7 @@ if __name__ == "__main__":
     print("Generating map...")
     print()
 
+    # Pad the agent extent by 300 m so agent-centered crops stay in bounds.
     x_min = x_min - 300
     x_max = x_max + 300
     y_min = y_min - 300
@@ -228,6 +243,7 @@ if __name__ == "__main__":
     height = 1.*canvas_size[0]/MAP_SCALE
     width = 1.*canvas_size[1]/MAP_SCALE
 
+    # Indices of map elements whose bounds overlap the padded agent extent.
     def indices_in_bounds(bounds):
         x_min_in = x_max > bounds[:, 0, 0]
         y_min_in = y_max > bounds[:, 0, 1]
@@ -237,14 +253,15 @@ if __name__ == "__main__":
 
     map_api = MapAPI(MAP_PATH, world_to_ecef)
 
+    # lanes_mask[0] marks boundaries treated as road dividers, [1] as lane
+    # dividers. Boundary divider_type repr codes classed as road dividers:
+    #   [10]/[11]/[12] curbs, [6] double-yellow-solid.
     lanes = []
     lanes_mask = [[], []]
     road_dividers = [
-        "[10]", "[11]", "[12]", # CURB_RED, CURB_YELLOW, CURB
-        "[6]", # DOUBLE_YELLOW_SOLID
-        # "[8]", # DOUBLE_YELLOW_SOLID_FAR_DASHED_NEAR
-        # "[9]", # DOUBLE_YELLOW_DASHED_FAR_SOLID_NEAR
-    ] 
+        "[10]", "[11]", "[12]",
+        "[6]",
+    ]
     for idx in indices_in_bounds(map_api.bounds_info["lanes"]["bounds"]):
         elem_id = map_api.bounds_info["lanes"]["ids"][idx]
         coords = map_api.get_lane_as_interpolation(
@@ -272,11 +289,12 @@ if __name__ == "__main__":
         coords = map_api.get_crosswalk_coords(elem_id)
         crosswalks.append(coords["xyz"][:,:2])
 
+    # Homography: world (x, y) -> image (row, col), origin at the upper-left corner.
     H = np.array([
         [0., -MAP_SCALE, (y_center+0.5*height)*MAP_SCALE],
         [MAP_SCALE, 0., -(x_center-0.5*width)*MAP_SCALE],
         [0., 0., 1.]
-    ]) # counts from left-top corner
+    ])
 
 
     im_lane = np.zeros(shape=(canvas_size[0], canvas_size[1]), dtype=np.uint8)
@@ -287,8 +305,8 @@ if __name__ == "__main__":
         lanes = np.reshape(lanes, (-1, 2, 1))
         lanes = np.concatenate((lanes, np.ones((lanes.shape[0], 1, 1))), 1)
         lanes = (H @ lanes).squeeze(-1)[:,:2]
-        # cv2.fillPoly function takes points in the format of (column, row)
-        lanes = lanes[:,::-1] # convert from row, column to column, row
+        # cv2 expects (column, row); H produces (row, column), so swap.
+        lanes = lanes[:,::-1]
         lanes = cv2_subpixel(lanes)
         for lane_area in lanes.reshape((-1,INTERPOLATION_POINTS*2, 2)):
             cv2.fillPoly(im_lane, [lane_area], 255, **CV2_SUB_VALUES)
@@ -301,12 +319,13 @@ if __name__ == "__main__":
         crosswalks = np.concatenate(crosswalks).reshape(-1, 2, 1)
         crosswalks = np.concatenate((crosswalks, np.ones((crosswalks.shape[0], 1, 1))), 1)
         crosswalks = (H @ crosswalks).squeeze(-1)[:,:2]
-        # cv2.fillPoly function takes points in the format of (column, row)
-        crosswalks = crosswalks[:,::-1] # convert from row, column to column, row
+        # cv2 expects (column, row); H produces (row, column), so swap.
+        crosswalks = crosswalks[:,::-1]
         crosswalks = cv2_subpixel(crosswalks)
         crosswalks = np.split(crosswalks, indices[:-1])
         cv2.fillPoly(im_crosswalk, crosswalks, 255, **CV2_SUB_VALUES)
 
+    # 3 channels: lane+crosswalk, road divider, lane divider -> [-1, 1].
     im_lane = (im_lane/255).astype(np.float32)*0.75 + (im_crosswalk/255).astype(np.float32)*0.25
     im_road_divider = im_road_divider.astype(np.float32)/255
     im_lane_divider = im_lane_divider.astype(np.float32)/255

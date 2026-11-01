@@ -156,19 +156,19 @@ class ContextVAE(torch.nn.Module):
         self.dec = ContextVAE.DecoderZH(z_dim, hidden_dim_fy, hidden_dim_fy, d_dim)
 
         self.embed_s = torch.nn.Sequential(
-            torch.nn.Linear(4, 64),             # v, a
+            torch.nn.Linear(4, 64),             # self state: velocity, acceleration
             torch.nn.ReLU6(),
             torch.nn.Linear(64, self_embed_dim)
         )
         self.embed_n = torch.nn.Sequential(
-            torch.nn.Linear(4, 64),             # dp, dv
+            torch.nn.Linear(4, 64),             # neighbor state: rel. position, rel. velocity
             torch.nn.ReLU6(),
             torch.nn.Linear(64, neighbor_embed_dim),
             torch.nn.ReLU6(),
             torch.nn.Linear(neighbor_embed_dim, neighbor_embed_dim)
         )
         self.embed_k = torch.nn.Sequential(
-            torch.nn.Linear(3, feature_dim),    # dist, bear angle, mpd
+            torch.nn.Linear(3, feature_dim),    # attention key: distance, bearing, min. predicted distance
             torch.nn.ReLU6(),
             torch.nn.Linear(feature_dim, feature_dim),
             torch.nn.ReLU6(),
@@ -186,7 +186,7 @@ class ContextVAE(torch.nn.Module):
         self.rnn_fx = torch.nn.GRU(self_embed_dim+neighbor_embed_dim, hidden_dim_fx)
         init_dim = hidden_dim_fx//2 if self.use_map else hidden_dim_fx
         self.rnn_fx_init = torch.nn.Sequential(
-            torch.nn.Linear(2, init_dim), # dp
+            torch.nn.Linear(2, init_dim), # from the initial relative position
             torch.nn.ReLU6(),
             torch.nn.Linear(init_dim, init_dim*self.rnn_fx.num_layers),
             torch.nn.ReLU6(),
@@ -209,15 +209,16 @@ class ContextVAE(torch.nn.Module):
                 torch.nn.ReLU6(),
                 torch.nn.Linear(self.map_encode.feature_dim, self.rnn_fx_init[-1].out_features)
             )
-            self.rnn_fx_init_k = torch.nn.Sequential( # same with self.rnn_fx_init
-                # MaskedBatchNorm1d(2),
-                torch.nn.Linear(2, self.rnn_fx_init[-1].out_features//self.rnn_fx.num_layers), # dp
+            self.rnn_fx_init_k = torch.nn.Sequential( # attention keys over neighbors, from relative position
+                torch.nn.Linear(2, self.rnn_fx_init[-1].out_features//self.rnn_fx.num_layers),
                 torch.nn.ReLU6(),
                 torch.nn.Linear(self.rnn_fx_init[-1].out_features//self.rnn_fx.num_layers, self.rnn_fx_init[-1].out_features),
                 torch.nn.ReLU6(),
                 torch.nn.Linear(self.rnn_fx_init[-1].out_features, self.rnn_fx_init[-1].out_features),
             )
-            self.rnn_fx_init_map = torch.nn.Sequential( # init hidden state = (rnn_fx_init(dp), rnn_fx_init_map(map))
+            # With a map, the encoder's initial hidden state concatenates a social
+            # half (attention over neighbors) and a map half (rnn_fx_init_map(map)).
+            self.rnn_fx_init_map = torch.nn.Sequential(
                 torch.nn.Linear(self.map_encode.feature_dim, self.map_encode.feature_dim),
                 torch.nn.ReLU6(),
                 torch.nn.Linear(self.map_encode.feature_dim, self.map_encode.feature_dim),
@@ -266,7 +267,8 @@ class ContextVAE(torch.nn.Module):
             dp = neighbor_x - x.unsqueeze(-2)       # (L+1) x N x Nn x 2
             dv = neighbor_v - v.unsqueeze(-2)       # L x N x Nn x 2
 
-            # social features
+            # Social features per neighbor: distance, bearing, and minimum
+            # predicted distance (closest approach under constant velocity).
             dist = dp.norm(dim=-1)                          # (L+1) x N x Nn
             mask = dist <= self.ob_radius
             dp0, mask0 = dp[0], mask[0]
@@ -333,18 +335,22 @@ class ContextVAE(torch.nn.Module):
 
 
     def forward(self, *args, **kwargs):
-        # We put the training and testing forward function together in order to support 
-        #   DistributedDataParallel better.
-        # training:
-        #   x: L x N x 6
-        #   neighbor: L x N x Nn x 6, padding at Nn dimension using large value (e.g. 1e9)
-        #   output: args to self.loss()
-        # testing:
-        #   x: L x N x 6
-        #   neighbor: L x N x Nn x 6, padding at Nn dimension using large value (e.g. 1e9)
-        #   n_predictions: int, number of predictions
-        #   output: n_predictions x horizon x N x 2, for n_predictions > 0
-        #         horizon x N x 2, n_predictions=0 for deterministic prediction
+        # Training and inference share one forward() so DistributedDataParallel
+        # wraps the whole model cleanly. The mode follows self.training.
+        #
+        # Training inputs:
+        #   x        : L x N x 6
+        #   neighbor : L x N x Nn x 6, absent neighbors padded with 1e9 (see note below)
+        #   returns  : the (err, kl) args consumed by self.loss()
+        # Inference inputs:
+        #   x        : L x N x 6
+        #   neighbor : L x N x Nn x 6, same 1e9 padding
+        #   n_predictions : number of stochastic samples (0 = deterministic)
+        #   returns  : n_predictions x horizon x N x 2 if n_predictions > 0,
+        #              else horizon x N x 2 (posterior mean)
+        #
+        # The 1e9 pad is deliberate: enc() keeps neighbors with dist <= ob_radius,
+        # so a huge distance drops padded slots. Zero-padding would pass the mask.
 
         self.rnn_fx.flatten_parameters()
         self.rnn_fy.flatten_parameters()

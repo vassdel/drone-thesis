@@ -5,9 +5,8 @@ import numpy as np
 from sklearn.cluster import KMeans
 
 def ADE_FDE(y_, y, batch_first=False):
-    # average displacement error
-    # final displacement error
-    # y_, y: S x L x N x 2
+    # Average Displacement Error (mean over the horizon) and Final Displacement
+    # Error (last step). Inputs y_, y have shape S x L x N x 2.
     if torch.is_tensor(y):
         err = (y_ - y).norm(dim=-1)
     else:
@@ -24,7 +23,9 @@ def ADE_FDE(y_, y, batch_first=False):
     return ade, fde
 
 def clustering(y, n_samples):
-    # y: S x L x 2
+    # Reduce S sampled trajectories to n_samples modes via k-means on the
+    # flattened (L x 2) trajectories. Returns the cluster-center trajectories
+    # and the member count per cluster. Input y: S x L x 2.
     traj1d = np.reshape(y[...,:2], (*y.shape[:-2],-1))
     clustering = KMeans(n_samples, n_init=1).fit(traj1d)
     return np.reshape(clustering.cluster_centers_, (n_samples, *traj1d.shape[1:-1], -1, 2)), \

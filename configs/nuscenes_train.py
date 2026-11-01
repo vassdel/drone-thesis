@@ -1,16 +1,17 @@
-MIN_OB_HORIZON = 2
-OB_HORIZON = 5
-PRED_HORIZON = 12
-OB_RADIUS = 30
-MAP_SIZE = 224
+# nuScenes ContextVAE training. Horizons are in frames at 2 Hz (one frame = 0.5 s).
+MIN_OB_HORIZON = 2    # minimum observed frames to form a window
+OB_HORIZON = 5        # observation window: 5 frames = 2 s
+PRED_HORIZON = 12     # prediction horizon: 12 frames = 6 s
+OB_RADIUS = 30        # neighbor-selection radius in meters
+MAP_SIZE = 224        # HD-map raster patch side in pixels
 
 
 lr = 3e-4
 epochs = 100
-test_since = 60
+test_since = 60       # start evaluating from epoch 60
 preload_data = True
 pred_samples = 5
-clustering = 0
+clustering = 0        # eval-time clustering is enabled in nuscenes_eval.py
 
 train_dataloader = dict(
     min_ob_horizon=MIN_OB_HORIZON,

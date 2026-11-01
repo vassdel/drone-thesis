@@ -1,75 +1,58 @@
 """
-Offline replay driver: video in -> ContextVAE K=5 trajectory overlays out.
+Offline replay driver: video in -> ContextVAE K-sample trajectory overlays out.
 
-Purpose
--------
-Renders the deliverable: an offline replay of a UAV video through
-the integrated ContextVAE pipeline (`ContextVAEInferencer` +
-`PixelMetricShim` / `MovingCameraShim`), producing K=5 future trajectory
-samples per tracked agent as overlays on the source video.
-
-Unlike `scene_recog_socket_yolov8.py` (the live socket server), this driver
-runs entirely offline against a recorded mp4 (`--input`) OR a folder of
-frame images (`--input-images`). The K=5 trajectories are kept individually
-(not mean-collapsed) so the overlay shows the model's multi-modality.
+Renders an offline replay of a UAV video through the integrated ContextVAE
+pipeline (`ContextVAEInferencer` + `PixelMetricShim` / `ScaleOnlyShim` /
+`MovingCameraShim`), drawing K future-trajectory samples per tracked agent as
+overlays on the source video. Unlike `scene_recog_socket_yolov8.py` (the live
+socket server), this driver runs entirely offline against a recorded mp4
+(`--input`) or a folder of frame images (`--input-images`). The K samples are
+kept individually (not mean-collapsed) so the overlay shows multi-modality.
 
 Bbox sources (`--anno-format`)
 ------------------------------
-Three ways to obtain the per-frame agent boxes the pipeline tracks:
   - `synth-json`    : ground-truth boxes from the synthetic-clip JSON
-                      (`synth_clip_gen.py`). Used for the inD orthomap demo;
-                      YOLOv8 can't reliably detect the rendered rectangles.
-  - `visdrone-mot`  : ground-truth boxes from a VisDrone-MOT
-                      `annotations.txt` (the GT-driven replay).
+                      (`synth_clip_gen.py`). Used for the inD orthomap demo,
+                      where YOLOv8 can't reliably detect the rendered boxes.
+  - `visdrone-mot`  : ground-truth boxes from a VisDrone-MOT `annotations.txt`.
   - `yolo-deepsort` : live YOLOv8 + DeepSORT detection on the frames — the
-                      "zero annotations" END-TO-END path. No annotation file;
-                      pixel->metric scale is auto-calibrated from detected
-                      car bboxes (override with `--scale-mpp`). Requires
-                      `ultralytics` + `deep_sort_realtime` (present in the
-                      `new_xupei_env` conda env).
+                      "zero annotations" end-to-end path. No annotation file;
+                      pixel->metric scale is auto-calibrated from detected car
+                      bboxes (override with `--scale-mpp`). Requires
+                      `ultralytics` + `deep_sort_realtime`.
 
 Two-mode operation
 ------------------
-- `--ego-motion=false` (stationary):
-    Use `PixelMetricShim`. Pixel<->metric conversion assumes the live
-    video frame == the un-padded `XX_background.png`. On the synthetic
-    clip — which DOES pan/zoom — this should produce visibly drifting
-    predictions. That drift is the failure mode the ego-motion shim
-    addresses, and the side-by-side comparison is the qualitative
-    artifact for Ch6.
-
-- `--ego-motion=true` (moving camera):
-    Use `MovingCameraShim`. Per-frame `update_frame(frame, masks)` runs
-    ORB+RANSAC to estimate `H_live -> K0`, then composes with the static
-    `H_K0 -> world` from the orthomap pickle. Predictions are world-frame
-    anchored, so the overlay tracks the ground correctly even as the
-    camera pans.
+- `--ego-motion=false` (stationary): `PixelMetricShim` assumes the live frame
+    == the un-padded `XX_background.png`. On a panning/zooming clip the
+    predictions visibly drift — the failure mode the ego-motion path fixes,
+    and the side-by-side is a useful qualitative comparison.
+- `--ego-motion=true` (moving camera): `MovingCameraShim` runs per-frame
+    ORB+RANSAC (`update_frame`) to estimate H_live -> K0 and composes with the
+    static K0 -> world step. Predictions are world-anchored, so the overlay
+    tracks the ground even as the camera pans.
 
 Inference cadence
 -----------------
-ContextVAE operates at 5 Hz. The synthetic clip is 25 fps with
-`frame_repeat=5` (each underlying inD 5-Hz step is held for 5 video
-frames). We therefore append to per-agent history once every `--fps-step`
-video frames (default 5 -> 5 Hz history), and invoke `infer_samples()`
-once per 5-Hz tick as soon as the chosen target has 10 history samples.
-The most recent K=5 prediction is then rendered onto EVERY video frame
-between ticks; because the trajectories are in world coords, the shim
-converts them to live-pixel coords per frame, producing an overlay that
-tracks the ground as the camera moves.
+ContextVAE runs at 5 Hz. History is appended once every `--fps-step` video
+frames, and `infer_samples()` fires once per 5-Hz tick as soon as the target
+has OB_HORIZON samples. The most recent K-sample prediction is rendered on
+EVERY frame until the next tick; since the trajectories are stored in world
+coords, the shim re-projects them to live pixels per frame so they track the
+ground as the camera moves.
 
 Overlay style
 -------------
-Per the Week 3 plan and the user-confirmed choice:
-- Past observation (last 10 5-Hz steps of the target): bold blue polyline.
-- K=5 predicted samples: semi-transparent red polylines via alpha-blending.
-- Mean over K: bold red polyline drawn on top of the K samples.
-- Mode marker: small filled circles at the endpoint of each sample.
+- Past observation (target): bold blue polyline.
+- K predicted samples: semi-transparent red polylines (alpha-blended).
+- Mean over K: bold red polyline on top.
+- Endpoint markers: filled circles at each sample's end.
 
 Usage
 -----
-Run from the repo root (this file adds its own dir to sys.path, so the
-sibling-module imports resolve regardless of cwd). The yolo-deepsort path
-needs the detector deps, so use:
+Run from the repo root (this file adds its own dir to sys.path, so sibling
+imports resolve regardless of cwd). The yolo-deepsort path needs the detector
+deps:
     PY=/home/vdelis/anaconda3/envs/new_xupei_env/bin/python
     DRIVER=uav_guidance/server_code_only/main_program/replay_video.py
 
@@ -142,7 +125,7 @@ from typing import Deque, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-# Local sibling modules (we are running this file directly; the dir is on sys.path).
+# Put this file's dir on sys.path so sibling imports resolve when run directly.
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
@@ -214,9 +197,9 @@ def parse_args() -> argparse.Namespace:
     )
 
     # ---- shim selection: one of --map-pkl OR --scale-mpp ------------------
-    # Not `required` at the group level: the yolo-deepsort path auto-calibrates
-    # scale from car detections, so it needs NEITHER. The per-format validation
-    # below enforces "exactly one" for synth-json / visdrone-mot.
+    # Not required at the group level: yolo-deepsort auto-calibrates scale, so
+    # it needs neither. The per-format validation below enforces "exactly one"
+    # for synth-json / visdrone-mot.
     pix = p.add_mutually_exclusive_group(required=False)
     pix.add_argument(
         "--map-pkl",
@@ -290,8 +273,8 @@ def parse_args() -> argparse.Namespace:
 
     # --- per-format bbox-source validation --------------------------------
     if args.anno_format == "yolo-deepsort":
-        # Live detector: no annotation file, and an orthomap makes no sense
-        # (arbitrary footage, scale auto-calibrated from car detections).
+        # Live detector: no annotation file, and no orthomap (arbitrary
+        # footage; scale is auto-calibrated from car detections).
         if args.gt_json is not None:
             p.error("--gt-json is not used with --anno-format yolo-deepsort.")
         if args.map_pkl is not None:
@@ -306,7 +289,7 @@ def parse_args() -> argparse.Namespace:
                 "(use the no-map S-ATTN checkpoint)."
             )
     else:
-        # File-based sources REQUIRE the annotation file and exactly one shim.
+        # File-based sources require the annotation file and exactly one shim.
         if args.gt_json is None:
             p.error(f"--gt-json is required for --anno-format {args.anno_format}.")
         if args.map_pkl is None and args.scale_mpp is None:
@@ -315,11 +298,9 @@ def parse_args() -> argparse.Namespace:
                 "--map-pkl (orthomap) or --scale-mpp (scalar calibration)."
             )
 
-    # Cross-arg consistency: --scale-mpp implies no map, which means we MUST
-    # use the no-map ckpt; --map-pkl REQUIRES the M-ATTN ckpt (or the
-    # checkpoint's map_model has to match). Enforce the combo here so a
-    # checkpoint/shim mismatch fails at arg-parse rather than at state_dict
-    # load time with a confusing shape error.
+    # Cross-arg consistency: --scale-mpp implies no map (no-map ckpt);
+    # --map-pkl requires the M-ATTN ckpt. Enforced here so a checkpoint/shim
+    # mismatch fails at arg-parse, not with a confusing state_dict shape error.
     if args.scale_mpp is not None and args.map_model != "none":
         p.error("--scale-mpp implies no orthomap; pass --map-model none too.")
     if args.map_pkl is not None and args.map_model == "none":
@@ -429,14 +410,12 @@ def load_visdrone_bboxes(
     fps : int
         Defaults to 30. Informational only.
     mask_bboxes_by_frame : Dict[int, List[(l, t, w, h)]]
-        ALL annotated bboxes per frame (vehicles + pedestrians + motors +
-        ignored regions etc.), used to mask the ORB feature detector in
-        `MovingCameraShim.update_frame`. Critical: if we mask only the
-        vehicle bboxes, ORB picks up features on pedestrians and motors,
-        those features don't match across frames, and the RANSAC inlier
-        ratio collapses -> 86 %+ of frames go FROZEN. By masking ALL
-        annotated moving objects, ORB is constrained to the static
-        background and the per-frame homography fit converges.
+        ALL annotated bboxes per frame (every class, not just vehicles), used
+        to mask the ORB feature detector in `MovingCameraShim.update_frame`.
+        Masking only vehicles would leave features on pedestrians/motors; those
+        don't match across frames and collapse the RANSAC inlier ratio, which
+        freezes most frames. Masking all moving objects constrains ORB to the
+        static background so the per-frame homography fit converges.
     """
     import glob
 
@@ -478,9 +457,8 @@ def load_visdrone_bboxes(
             aid = int(parts[1])
             l, t, w, h = (float(parts[i]) for i in range(2, 6))
             klass = int(parts[7])
-            frame_0idx = frame_1idx - 1  # VisDrone -> driver convention
-            # EVERY annotated bbox goes into the ORB mask, regardless of
-            # class — see docstring for the rationale.
+            frame_0idx = frame_1idx - 1  # VisDrone 1-indexed -> 0-indexed
+            # Every annotated bbox (any class) feeds the ORB mask; see docstring.
             mask_bboxes_by_frame.setdefault(frame_0idx, []).append((l, t, w, h))
             if klass not in _VISDRONE_VEHICLE_CLASSES:
                 n_dropped_class += 1
@@ -533,12 +511,9 @@ class ImageFolderCapture:
                 out.extend(glob.glob(os.path.join(d, ext)))
             return out
 
-        # Accept BOTH on-disk layouts transparently:
-        #   <folder>/*.jpg            (raw VisDrone splits: sequences/<seq>/*.jpg)
-        #   <folder>/img/*.jpg        (reorganized: data/visdrone/<seq>/img/*.jpg)
-        # If the folder itself has no frames but an `img/` subdir does, descend
-        # into it. This is what lets a visdrone_levelx-driven run point at the
-        # bare sequence dir regardless of which layout that split uses.
+        # Accept both on-disk layouts: frames directly in <folder>, or under
+        # <folder>/img/. If the folder has none but an img/ subdir does,
+        # descend into it, so a run can point at the bare sequence dir either way.
         paths = _glob_frames(folder)
         if not paths and os.path.isdir(os.path.join(folder, "img")):
             paths = _glob_frames(os.path.join(folder, "img"))
@@ -549,8 +524,8 @@ class ImageFolderCapture:
         paths.sort()
         self._paths = paths
         self._idx = 0
-        # Probe the first frame for shape WITHOUT consuming it (we re-read
-        # in read() below). Acceptable to pay the decode cost once.
+        # Probe the first frame's shape; read() re-decodes it later (one extra
+        # decode is acceptable).
         first = cv2.imread(paths[0])
         if first is None:
             raise RuntimeError(f"cv2 failed to decode {paths[0]}")
@@ -587,14 +562,13 @@ class ImageFolderCapture:
 # Bbox-source loader (live YOLOv8 + DeepSORT — the "zero annotations" path)
 # ---------------------------------------------------------------------------
 
-# Scale-calibration constants, mirrored from preprocessing/process_visdrone.py
-# so the end-to-end path produces the same metric scale as the GT-based eval.
+# Scale-calibration constants, matching preprocessing/process_visdrone.py so
+# the end-to-end path yields the same metric scale as the GT-based eval.
 _ASSUMED_CAR_LEN_M = 4.5      # sedan length used to turn px -> metres
-_DEFAULT_MPP = 0.045         # hard fallback m/px if no car ever detected
-# Default vehicle class NAMES (lowercase). Resolved against the model's own
-# `names` map at load time — NOT hardcoded ids — because a "visdrone" YOLO
-# checkpoint may actually carry COCO class indices (car=2, bus=5, truck=7,
-# and no "van"), so id {4,5,6,9} would select the wrong classes entirely.
+_DEFAULT_MPP = 0.045         # fallback m/px if no car is ever detected
+# Default vehicle class NAMES (lowercase), resolved against the model's own
+# `names` map at load time (not hardcoded ids): a "visdrone" YOLO checkpoint
+# may actually use COCO indices, where hardcoded ids would select wrong classes.
 _DEFAULT_KEEP_CLASS_NAMES = frozenset({"car", "van", "truck", "bus"})
 
 
@@ -618,36 +592,34 @@ def load_yolo_deepsort_bboxes(
 
     Why a pre-pass (not interleaved with the render loop)?
     -----------------------------------------------------
-    `pick_target_aid` (called in main() before the render loop starts) scans
-    the FULL `by_frame` to choose the target. A detector running inside the
-    render loop couldn't populate `by_frame` in time. DeepSORT also needs
-    frames in temporal order, which a single forward pass gives us anyway.
+    `pick_target_aid` (called before the render loop) scans the full
+    `by_frame` to choose the target, so it must be fully populated first.
+    DeepSORT also needs frames in temporal order, which one forward pass gives.
 
     Detection helper
     ----------------
-    We deliberately do NOT reuse `scene_recog_socket_yolov8.get_boxes_feats_yolov8`:
-    that calls `model(img, conf=.., return_class_logits=True)` — a Ntousis
-    ultralytics patch whose `f_lst` output exists only for the re-ID
-    similarity map, which replay does not need. We call the model plainly and
-    build the `(ltwh, conf, cls)` tuples DeepSORT consumes.
+    This does NOT reuse the server's `get_boxes_feats_yolov8`, which requests
+    per-class logits (an ultralytics patch from the original server) for the
+    re-ID similarity map that replay doesn't need. We call the model plainly
+    and build the `(ltwh, conf, cls)` tuples DeepSORT consumes.
 
     Class resolution
     ----------------
-    Vehicle classes are resolved by NAME from `model.names` (see
-    `_DEFAULT_KEEP_CLASS_NAMES`). Cars (specifically) drive the auto-scale.
+    Vehicle classes are resolved by name from `model.names`; cars specifically
+    drive the auto-scale.
 
     Returns
     -------
-    Same 6 fields as `load_visdrone_bboxes`, PLUS a 7th:
+    Same 6 fields as `load_visdrone_bboxes` plus `m_per_px`:
     by_frame, n_frames, k0_shape_hw, frame_repeat, fps, mask_bboxes_by_frame,
     m_per_px
-        `mask_bboxes_by_frame` holds EVERY raw detection (all classes) so the
-        ORB feature mask in ego-motion mode excludes all moving objects — the
-        same all-bboxes policy `load_visdrone_bboxes` uses to avoid the ORB
-        fit freezing. `m_per_px` is the auto-calibrated scale (or the override).
+        `mask_bboxes_by_frame` holds every raw detection (all classes) so the
+        ORB mask excludes all moving objects (same policy as
+        `load_visdrone_bboxes`). `m_per_px` is the auto-calibrated scale (or
+        the override).
     """
-    # Lazy imports: only the yolo-deepsort path needs these heavy deps, so the
-    # synth-json / visdrone-mot paths keep working without them installed.
+    # Lazy imports: only this path needs the heavy detector deps, so the other
+    # paths work without them installed.
     from ultralytics import YOLO
     from deep_sort_realtime.deepsort_tracker import DeepSort
 
@@ -692,7 +664,7 @@ def load_yolo_deepsort_bboxes(
         if h_img == 0:
             h_img, w_img = frame.shape[:2]
 
-        # --- detect (plain call; no return_class_logits / no f_lst) ---------
+        # --- detect (plain call; no per-class-logits request) --------------
         res = model(frame, conf=conf, verbose=False)[0]
         results: List[Tuple[List[float], float, int]] = []
         boxes = res.boxes
@@ -715,9 +687,9 @@ def load_yolo_deepsort_bboxes(
             if cls in car_ids:
                 car_long_axes.append(max(ltwh[2], ltwh[3]))
 
-        # DeepSORT: pass the FRAME via the `frame=` kwarg so the mobilenet
-        # embedder computes appearance features. (The Ntousis server passes it
-        # positionally, where it lands in `embeds` — a latent bug we avoid.)
+        # Pass the frame via the `frame=` kwarg so DeepSORT's embedder computes
+        # appearance features. (Passing it positionally would bind it to
+        # `embeds` instead — a bug in the original server call site.)
         tracks = tracker.update_tracks(veh, frame=frame)
         for tr in tracks:
             if not tr.is_confirmed():
@@ -734,7 +706,7 @@ def load_yolo_deepsort_bboxes(
     cap.release()
     n_frames = frame_idx + 1
 
-    # --- auto-scale: m/px = assumed car length / median car-bbox long axis ---
+    # --- auto-scale: m/px = assumed car length / median car-bbox long axis --
     if scale_override is not None:
         m_per_px = float(scale_override)
         scale_src = "override"
@@ -766,27 +738,20 @@ def pick_target_aid(by_frame: Dict[int, List[Dict]], forced: Optional[int]) -> i
     """
     Pick the agent-id to use as the ContextVAE target.
 
-    If `forced` is given, returns it (raises if not present at all).
+    If `forced` is given, returns it (raises if absent).
 
-    Otherwise scores each agent by `appearances * total_pixel_motion` and
-    picks the winner. The motion term is important: an auto-picker that
-    only counts appearances will happily pick a car that's STOPPED at a
-    red light for the entire observation window, in which case the
-    driver's atan2-finite-difference heading estimate collapses to
-    pure noise and the model predicts in an arbitrary direction. Cars
-    that are actually driving give a clean heading and visually
-    meaningful predictions.
+    Otherwise scores each agent by `appearances * total_pixel_motion`. The
+    motion term matters: an appearances-only picker would happily select a car
+    stopped at a light for the whole window, where the finite-difference
+    heading estimate collapses to noise and the prediction points arbitrarily.
+    Moving cars give a clean heading and meaningful overlays.
 
-    Pixel-space motion is noisy on moving-camera footage (mixes agent
-    motion with camera motion), but the noise is symmetric: agents that
-    are TRULY stationary score near zero regardless of camera pan,
-    while agents that are moving score high because their pixel
-    displacement includes their world motion. Good enough for an
-    auto-pick; the user can always override via `--target-aid`.
+    Pixel motion is noisy on moving-camera footage (it mixes agent and camera
+    motion), but truly stationary agents still score near zero regardless of
+    pan, so this is good enough for an auto-pick; override via `--target-aid`.
     """
     if forced is not None:
-        # Pre-collect the universe of aids so we can give a useful error
-        # when forced doesn't exist.
+        # Collect all aids up front for a useful error if `forced` is absent.
         seen = {a["aid"] for agents in by_frame.values() for a in agents}
         if forced not in seen:
             raise SystemExit(
@@ -795,8 +760,7 @@ def pick_target_aid(by_frame: Dict[int, List[Dict]], forced: Optional[int]) -> i
             )
         return forced
 
-    # Build per-aid time series sorted by frame_idx, then compute
-    # cumulative pixel displacement.
+    # Per-aid time series sorted by frame, then cumulative pixel displacement.
     series: Dict[int, List[Tuple[int, float, float]]] = collections.defaultdict(list)
     for fr_idx, agents in by_frame.items():
         for a in agents:
@@ -813,11 +777,9 @@ def pick_target_aid(by_frame: Dict[int, List[Dict]], forced: Optional[int]) -> i
             du = pts[i][1] - pts[i - 1][1]
             dv = pts[i][2] - pts[i - 1][2]
             total_disp += math.hypot(du, dv)
-        # Composite score. The product matters more than the formula —
-        # both terms must be non-trivial for the agent to be a useful
-        # target. Adding 1 to total_disp avoids 0-score elimination of
-        # stationary-but-long-lived agents (still better to pick a
-        # stopped car that exists everywhere than nothing).
+        # Product score: both appearances and motion must be non-trivial. The
+        # +1 on total_disp keeps long-lived-but-stationary agents eligible (a
+        # stopped car present everywhere still beats nothing).
         scores.append((len(pts) * (total_disp + 1.0), aid))
 
     if not scores:
@@ -825,7 +787,7 @@ def pick_target_aid(by_frame: Dict[int, List[Dict]], forced: Optional[int]) -> i
             "pick_target_aid: no agent has 2+ appearances; nothing to "
             "predict on. Check the annotation file."
         )
-    # Sort by (-score, aid): highest score wins, ties broken low.
+    # Highest score wins; break ties by lower aid.
     scores.sort(key=lambda sa: (-sa[0], sa[1]))
     return scores[0][1]
 
@@ -838,10 +800,9 @@ class AgentHistory:
     """
     Per-agent ring buffer of (x_m, y_m) world positions, length OB_HORIZON.
 
-    We store world coords directly (the shim does the live->world conversion
-    before append). This means an ego-motion shim's per-frame H is applied
-    EAGERLY at append time, and the cached history doesn't have to be
-    re-projected when the camera moves further.
+    World coords are stored directly (the shim converts live->world before
+    append), so an ego-motion shim's per-frame H is applied eagerly and the
+    cached history never needs re-projection as the camera moves on.
     """
 
     def __init__(self) -> None:
@@ -857,12 +818,11 @@ class AgentHistory:
         return np.asarray(self._buf, dtype=np.float64)
 
     def heading_estimate(self) -> Optional[float]:
-        """First-obs-frame heading from finite difference (atan2).
+        """First-obs-frame heading from a finite difference (atan2).
 
-        Returns None if too few samples to estimate; otherwise radians
-        in world frame. We use this in lieu of a true heading source,
-        accepting the documented degradation on stationary agents. For
-        the synthetic-clip target (a moving vehicle) this is fine.
+        Returns None if there are too few samples, else radians in the world
+        frame. Used in lieu of a true heading source, accepting the known
+        degradation on stationary agents (fine for a moving-vehicle target).
         """
         if len(self._buf) < 2:
             return None
@@ -893,7 +853,7 @@ def draw_overlay(
     mean_uv: Optional[np.ndarray],
 ) -> np.ndarray:
     """
-    Render past+K=5+mean overlay onto a copy of the frame.
+    Render past + K-sample + mean overlay onto a copy of the frame.
 
     Parameters
     ----------
@@ -915,10 +875,8 @@ def draw_overlay(
         cv2.polylines(out, [pts], isClosed=False, color=_PAST_COLOR,
                       thickness=_PAST_THICK, lineType=cv2.LINE_AA)
 
-    # 2) K=5 predicted samples — alpha-blended.
-    # Draw on an overlay copy, then addWeighted into `out`. This keeps the
-    # alpha cheap (one addWeighted) and looks clean regardless of how many
-    # samples overlap.
+    # 2) K predicted samples, alpha-blended. Draw onto a copy, then a single
+    # addWeighted into `out` — cheap and clean regardless of overlap.
     if samples_uv is not None and samples_uv.shape[1] >= 2:
         overlay = out.copy()
         for k in range(samples_uv.shape[0]):
@@ -933,8 +891,8 @@ def draw_overlay(
         cv2.addWeighted(overlay, _SAMPLE_ALPHA, out, 1.0 - _SAMPLE_ALPHA, 0.0,
                         dst=out)
 
-    # 3) Mean polyline — opaque, drawn ON TOP of the alpha-blended samples
-    # so it remains the most visible track.
+    # 3) Mean polyline, opaque and on top of the samples so it stays most
+    # visible.
     if mean_uv is not None and len(mean_uv) >= 2:
         pts = mean_uv.astype(np.int32).reshape(-1, 1, 2)
         cv2.polylines(out, [pts], isClosed=False, color=_MEAN_COLOR,
@@ -956,15 +914,12 @@ def draw_hud(
     """
     Draw a one-line status HUD at the top-left, mutating `frame_bgr`.
 
-    When `failure_banner` is provided, also draws a large red banner across
-    the top of the frame to make the "this output is intentionally wrong"
-    nature of the stationary baseline self-explanatory to a Ch6 reader who
-    can't see the diagnostic numbers in the terminal.
+    When `failure_banner` is provided, also draws a large red banner across the
+    top so a reader can see the stationary-baseline output is intentionally
+    wrong without the terminal diagnostics.
     """
-    # --- Top-of-frame banner (stationary mode only) ---------------------
-    # We render this BEFORE the status line so the small status text sits
-    # below it. The banner is intentionally heavy-weight: large red text
-    # with a black outline so it survives JPEG/video compression.
+    # Banner first so the status line sits below it. Large red text with a
+    # black outline so it survives video compression.
     if failure_banner:
         H_img, W_img = frame_bgr.shape[:2]
         # Center horizontally; sit just below the top edge.
@@ -987,8 +942,7 @@ def draw_hud(
         label += f"  shim={last_status}"
     if last_inf_ms is not None:
         label += f"  inf={last_inf_ms:.1f}ms"
-    # Push the status line further down when the banner is present so the
-    # two don't overlap.
+    # Push the status line down when the banner is present to avoid overlap.
     y_status = 60 if failure_banner else 22
     cv2.putText(
         frame_bgr, label, (10, y_status),
@@ -1025,17 +979,15 @@ def main() -> int:
     print(f"[replay] ckpt         = {args.ckpt}")
 
     # --- Bbox stream ----------------------------------------------------
-    # Load first so we know `n_frames` and the source `(H, W)` for the
-    # scale-only origin default.
-    # `mask_bboxes_by_frame` is the union of ALL annotated bboxes per
-    # frame (vehicles + pedestrians + motors + ignored regions). It's
-    # used ONLY for masking the ORB feature detector in ego-motion mode;
-    # the trackable agents fed to ContextVAE come from `by_frame` which
-    # is vehicle-only. For the synth path we fall back to the vehicle
-    # bboxes (no separate non-vehicle annotations exist in that schema).
+    # Load first so n_frames and the source (H, W) are known (the latter sets
+    # the scale-only origin default). `mask_bboxes_by_frame` is the union of
+    # all annotated bboxes per frame, used only to mask the ORB detector in
+    # ego-motion mode; the trackable agents fed to ContextVAE come from the
+    # vehicle-only `by_frame`. The synth path has no separate non-vehicle
+    # annotations, so it reuses the vehicle bboxes.
     mask_bboxes_by_frame: Optional[Dict[int, List[Tuple[float, float, float, float]]]] = None
-    # Scale auto-calibrated by the yolo-deepsort detector pre-pass; None for the
-    # file-based sources (which carry an explicit --scale-mpp or --map-pkl).
+    # Auto-calibrated by the yolo-deepsort pre-pass; None for file-based
+    # sources (which carry an explicit --scale-mpp or --map-pkl).
     auto_scale_mpp: Optional[float] = None
     if args.anno_format == "synth-json":
         by_frame, n_frames, k0_shape_hw, frame_repeat, fps_src = load_gt_bboxes(
@@ -1080,8 +1032,7 @@ def main() -> int:
     )
 
     # --- Inferencer ----------------------------------------------------
-    # The argparse cross-arg check already ensured (--scale-mpp <-> --map-model none)
-    # and (--map-pkl <-> --map-model resnet18) are consistent.
+    # The argparse cross-arg check already enforced shim/map-model consistency.
     map_model_override = None if args.map_model == "none" else args.map_model
     inferencer = ContextVAEInferencer(
         ckpt_path=args.ckpt,
@@ -1096,17 +1047,15 @@ def main() -> int:
     )
 
     # --- Shim ----------------------------------------------------------
-    # Build the STATIC base shim (homography or scale-only). When
-    # --ego-motion=true, wrap it in MovingCameraShim for per-frame ORB+RANSAC
-    # compensation. The wrap is uniform across both base shim types thanks
-    # to the four-method API contract enforced earlier.
+    # Build the static base shim (homography or scale-only); when
+    # --ego-motion=true, wrap it in MovingCameraShim for per-frame ORB+RANSAC.
+    # The wrap is uniform across both base shim types (shared four-method API).
     if args.map_pkl is not None:
         base_shim = PixelMetricShim(args.map_pkl)
     else:
-        # ScaleOnlyShim: default origin to frame center (read from bbox source).
-        # Scale priority: explicit --scale-mpp > yolo-deepsort auto-calibration.
-        # (For yolo-deepsort the loader already folded --scale-mpp into
-        # `auto_scale_mpp` when present, so a single source of truth remains.)
+        # ScaleOnlyShim: origin defaults to frame center. Scale priority is
+        # explicit --scale-mpp over the yolo-deepsort auto-calibration (the
+        # loader already folds --scale-mpp into auto_scale_mpp when present).
         h_img, w_img = k0_shape_hw
         if args.origin_uv is not None:
             origin_uv = (float(args.origin_uv[0]), float(args.origin_uv[1]))
@@ -1129,14 +1078,14 @@ def main() -> int:
         )
 
     if use_ego:
-        # Compose: ORB+RANSAC for live->K0, base shim for K0->world.
+        # ORB+RANSAC for live->K0 composed with the base shim's K0->world.
         shim = MovingCameraShim(base_shim=base_shim)
     else:
         shim = base_shim
 
     # --- Frame source --------------------------------------------------
-    # Either an MP4 (cv2.VideoCapture) or a folder of JPEGs/PNGs
-    # (ImageFolderCapture). The two implement the same minimal interface.
+    # MP4 (cv2.VideoCapture) or a folder of JPEGs/PNGs (ImageFolderCapture);
+    # both implement the same minimal interface.
     if args.input is not None:
         cap = cv2.VideoCapture(args.input)
     else:
@@ -1158,9 +1107,8 @@ def main() -> int:
 
     # --- Per-track state ----------------------------------------------
     histories: Dict[int, AgentHistory] = {}
-    # Cache for the most recent inference output, drawn over every frame
-    # until the next 5-Hz tick fires. Stored in WORLD coords so we can
-    # re-project per frame as the camera moves.
+    # Most recent inference output, redrawn every frame until the next 5-Hz
+    # tick. Kept in world coords so it can be re-projected as the camera moves.
     cached_samples_world: Optional[np.ndarray] = None   # (K, T_pred, 2)
     cached_past_world:    Optional[np.ndarray] = None   # (OB_HORIZON, 2)
 
@@ -1169,8 +1117,7 @@ def main() -> int:
     n_inferences = 0
     last_inf_ms: Optional[float] = None
     last_shim_status: str = ""
-    # Per-frame world-position error of the target (for the ego-motion
-    # validation criterion in the plan).
+    # Per-frame world-position error of the target (ego-motion validation).
     pos_errors_m: List[float] = []
 
     frame_idx = -1
@@ -1182,14 +1129,12 @@ def main() -> int:
         if frame_idx >= n_frames:
             break
 
-        # 1) Update the shim for this frame (ego-motion mode only). We
-        # pass the union of agent bboxes so ORB excludes moving objects.
-        # On VisDrone we use the full annotation set (vehicles + peds +
-        # motors + ignored) — masking only the vehicle subset leaves
-        # pedestrians/motors free to inject moving features into the
-        # match pool, which empirically pushes 86 % of frames to FROZEN.
-        # On synth-json there are no non-vehicle annotations, so the
-        # vehicle list IS the full annotation set and we use it directly.
+        # 1) Update the shim for this frame (ego-motion mode only), passing the
+        # full set of agent bboxes so ORB excludes moving objects. VisDrone
+        # uses the complete annotation set (all classes); masking only vehicles
+        # would let pedestrians/motors inject moving features and freeze most
+        # frames. synth-json has only vehicle annotations, so that list is the
+        # full set.
         if use_ego:
             if mask_bboxes_by_frame is not None:
                 mask_bboxes = list(mask_bboxes_by_frame.get(frame_idx, []))
@@ -1198,10 +1143,9 @@ def main() -> int:
                 mask_bboxes = [a["ltwh_live"] for a in agents_this_frame]
             last_shim_status = shim.update_frame(frame_bgr, mask_bboxes_ltwh=mask_bboxes)
 
-        # 2) Append to per-agent histories at the 5-Hz cadence. We pick
-        # the BBOX CENTER as the agent's "position" and convert via the
-        # shim. Anchoring on the bbox center (not the corner) matches
-        # how the levelXdata preprocessing stored xCenter/yCenter.
+        # 2) Append to per-agent histories at the 5-Hz cadence. The agent's
+        # position is its bbox center (not a corner), matching how levelXdata
+        # preprocessing stored xCenter/yCenter, converted to world via the shim.
         if frame_idx % fps_step == 0:
             agents_this_frame = by_frame.get(frame_idx, [])
             for a in agents_this_frame:
@@ -1210,20 +1154,19 @@ def main() -> int:
                 try:
                     x_m, y_m = shim.pixel_to_metric(float(u), float(v))
                 except RuntimeError:
-                    # Degenerate homography (ego-motion frozen at startup, etc.).
+                    # Degenerate homography (e.g. ego-motion frozen at startup).
                     continue
                 histories.setdefault(aid, AgentHistory()).push(x_m, y_m)
 
-                # Diagnostic: GT world position is available in the JSON;
-                # accumulate position error for the target only.
+                # When GT world positions exist, accumulate the target's error.
                 if aid == target_aid and a.get("world_gt"):
                     xg, yg = a["world_gt"]
                     pos_errors_m.append(float(math.hypot(x_m - xg, y_m - yg)))
 
-            # 3) Run inference if the target has a full window.
+            # 3) Run inference once the target has a full observation window.
             target_hist = histories.get(target_aid)
             if target_hist is not None and target_hist.ready():
-                # Build neighbor dict from every OTHER aid that has 10 frames.
+                # Neighbors: every other aid with a full window.
                 neighbors = {
                     aid: hist.as_array()
                     for aid, hist in histories.items()
@@ -1241,8 +1184,8 @@ def main() -> int:
                 cached_samples_world = samples_world
                 cached_past_world = target_hist.as_array().copy()
 
-        # 4) Render: convert cached world-frame past + K samples to live
-        # pixels using the CURRENT frame's shim, then draw.
+        # 4) Render: project the cached world-frame past + K samples to live
+        # pixels using the current frame's shim, then draw.
         past_uv = None
         samples_uv = None
         mean_uv = None
@@ -1255,14 +1198,13 @@ def main() -> int:
                 mean_world = cached_samples_world.mean(axis=0)
                 mean_uv = shim.metrics_to_pixel(mean_world)
             except RuntimeError:
-                # Degenerate H in this frame — skip the overlay this frame.
+                # Degenerate H this frame — skip the overlay.
                 past_uv = samples_uv = mean_uv = None
 
         annotated = draw_overlay(frame_bgr, past_uv, samples_uv, mean_uv)
-        # Loud failure-mode banner ONLY in stationary mode — its overlays
-        # are expected to drift off-road when the camera moves, and the
-        # banner makes that intent legible to a thesis reader who isn't
-        # cross-referencing the terminal diagnostics.
+        # Failure banner in stationary mode only: its overlays are expected to
+        # drift off-road under camera motion, and the banner makes that intent
+        # legible without the terminal diagnostics.
         failure_banner = (
             "STATIONARY BASELINE - EXPECTED DRIFT (no ego-motion compensation)"
             if not use_ego else None

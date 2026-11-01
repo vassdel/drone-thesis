@@ -1,63 +1,53 @@
 """
-ContextVAE single-target streaming inference for the Ntousis UAV server.
+ContextVAE single-target streaming inference for the UAV server pipeline.
 
-Purpose
--------
-This module wraps a trained ContextVAE checkpoint so the Ntousis server-side
-pipeline (`scene_recog_socket_yolov8.py`) can call it on per-frame DeepSORT
-track histories and get K-sample future trajectories back.
+Wraps a trained ContextVAE checkpoint so the server-side pipeline
+(`scene_recog_socket_yolov8.py`, adapted from Ntousis' uav_guidance server)
+can call it on per-frame DeepSORT track histories and receive K-sample future
+trajectories. This replaces the LSTM predictor (`tr_pred_lstm`) in the
+original server.
 
-It replaces the LSTM call (`tr_pred_lstm`) that currently lives at lines
-583-594 of `scene_recog_socket_yolov8.py`.
-
-Why this lives in `uav_guidance/...` and NOT in `contextvae/`
------------------------------------------------------------
+Why a dedicated inferencer rather than the training Dataloader
+--------------------------------------------------------------
 The training-side `contextvae.data.Dataloader` is a batch-oriented torch
-Dataset that talks to on-disk `.txt`/`.info` files, per-pickle map rasters,
-and a ProcessPoolExecutor loader. None of that is appropriate at server-side
-inference, where we have:
-  - a single target track (batch dim N=1),
-  - history coming from a streaming DeepSORT buffer (not files),
-  - a known recording (so the map pickle is loaded ONCE at startup, not
-    re-fetched per item).
-The Dataloader's per-item map crop and heading rotation logic IS needed —
-we re-implement it here in a stripped-down, single-agent form rather than
-import the loader and drag along its training-only machinery.
+Dataset that reads on-disk `.txt`/`.info` files and per-pickle map rasters
+through a process-pool loader — none of which fits server-side inference,
+where we have a single target track (batch N=1), history from a streaming
+DeepSORT buffer, and a known recording whose map pickle is loaded once at
+startup. The loader's per-item map crop and heading-rotation logic is still
+needed, so it is re-implemented here in a stripped-down single-agent form.
 
-Coordinate frame contract
+Coordinate-frame contract
 -------------------------
-This module operates ENTIRELY in METRIC WORLD coordinates. Pixel<->metric
-conversion is the responsibility of the caller (see `pixel_metric_shim.py`).
-For Day 1-2 of the Week-3 integration, the shim uses a constant per-recording
-`orthoPxToMeter` scale (works only for a stationary drone clip). Day 2-4
-swaps the shim's internals for an ego-motion-compensated homography but
-keeps the same metric output, so this module does NOT change.
+This module operates ENTIRELY in metric world coordinates; pixel<->metric
+conversion is the caller's job (see `pixel_metric_shim.py` /
+`ego_motion_shim.py`). The stationary-drone shim uses a constant
+per-recording `orthoPxToMeter` scale; the moving-camera shim swaps in an
+ego-motion-compensated homography but keeps the same metric output, so this
+module is unaffected by which shim the caller uses.
 
-ContextVAE conventions baked in here
-------------------------------------
-1. Observation horizon `OB_HORIZON = 10` frames at 5 Hz (2 s).
-2. Prediction horizon `PRED_HORIZON = 25` frames at 5 Hz (5 s).
-3. Observation radius `OB_RADIUS = 30` m (radius-based neighbor filter).
-4. Map raster pre-baked to `(3, H, W)` in [-1, 1] with a 3x3 homography
-   `H` that maps world `(x, y)` to image `(row, col)`. Pickle format
-   matches `contextvae/data.py`'s `load_map` — namely a plain
-   `pickle.dump((semantic_map_ndarray, H_ndarray), f)` tuple.
-5. Neighbor tensor must span the FULL `L1 + L2` window (= 35 frames).
-   At inference we don't know future neighbor positions, so frames
-   `[OB_HORIZON .. OB_HORIZON+PRED_HORIZON]` are filled with `1e9`. The
-   ContextVAE encoder's radius mask (`dist <= ob_radius`) filters those
-   out. ZERO-PADDING IS WRONG — it silently passes the radius mask and
-   corrupts the social attention. See `contextvae/data.py:473-478`.
-6. Localization (matches `contextvae/data.py:502-521`): we rotate the
-   entire scene (target + neighbors) around the target's first-obs-frame
-   position `(x0, y0)` by `-heading`, where `heading` is the target's
-   direction at the first obs frame. After this, `target[0] = (x0, y0)`
-   unchanged and `target[1:]` is rotated. World coordinates are
-   PRESERVED — we do NOT translate the origin to `(x0, y0)`.
-7. K samples (default `K = 5`) are drawn from the timewise stochastic
-   decoder; we collapse to a single trajectory by mean-over-K to fit the
-   server's existing wire protocol (6 future `(x, y)` pairs). Week 4
-   will revisit multi-modal handling.
+ContextVAE conventions assumed here
+-----------------------------------
+1. Observation horizon OB_HORIZON = 10 frames at 5 Hz (2 s).
+2. Prediction horizon PRED_HORIZON = 25 frames at 5 Hz (5 s).
+3. Observation radius OB_RADIUS = 30 m (radius-based neighbor filter).
+4. Map raster pre-baked to (3, H, W) in [-1, 1] with a 3x3 homography H
+   mapping world (x, y) -> image (row, col). Pickle format matches
+   `contextvae/data.py`'s `load_map`: a `(semantic_map_ndarray, H_ndarray)`
+   tuple.
+5. The neighbor tensor must span the full L1 + L2 window (35 frames). Future
+   neighbor positions are unknown at inference, so frames
+   [OB_HORIZON .. OB_HORIZON+PRED_HORIZON) are padded with 1e9; the encoder's
+   radius mask (dist <= ob_radius) filters them. Zero-padding is wrong — it
+   silently passes the mask and corrupts social attention.
+6. Localization: the whole scene (target + neighbors) is rotated around the
+   target's first-obs-frame position (x0, y0) by -heading. target[0] stays
+   at (x0, y0); target[1:] is rotated. World coordinates are preserved — the
+   origin is NOT translated to (x0, y0).
+7. K samples (default K = 5) are drawn from the timewise stochastic decoder.
+   `infer()` collapses them to a single trajectory (mean over K) to fit the
+   server's 6-waypoint wire protocol; `infer_samples()` returns all K for
+   multi-modal rendering.
 
 Public API
 ----------
@@ -68,20 +58,17 @@ Public API
         device="cuda",
     )
     future_xy = inferencer.infer(
-        target_history_metric=(10, 2) np.ndarray of (x, y) in metric world coords,
-        neighbor_histories_metric={track_id: (10, 2) np.ndarray, ...},
-        heading_world=0.0,  # radians, world frame; matches training data.py:468.
-                            # If omitted, falls back to atan2 of target[1]-target[0]
-                            # AND emits a one-shot RuntimeWarning to surface the
-                            # degradation — see infer() docstring.
-    )  # returns (PROTOCOL_FUTURE_STEPS, 2) np.ndarray, mean over K samples,
-       # in METRIC WORLD coords (same frame as inputs).
+        target_history_metric,      # (10, 2) (x, y) in metric world coords
+        neighbor_histories_metric,  # {track_id: (10, 2) ndarray}
+        heading_world=0.0,          # radians, world frame; matches the loader
+    )  # -> (PROTOCOL_FUTURE_STEPS, 2) mean over K, in metric world coords.
 
-The caller converts `future_xy` back to pixels with the same shim it used
-on the inputs.
+Pass `heading_world` whenever a real heading is available; omitting it falls
+back to a finite-difference estimate that degrades for stationary agents (see
+`infer()`). The caller converts the result back to pixels with the same shim
+it used on the inputs.
 """
 
-# Standard library
 import os
 import sys
 import math
@@ -90,120 +77,90 @@ import warnings
 import importlib.util
 from typing import Dict, Optional
 
-# Third-party
 import numpy as np
 import torch
 
 # Make the project's `contextvae` package importable from this server-side
-# subdirectory. The repo layout is:
-#     <repo_root>/
-#         contextvae/
-#         uav_guidance/server_code_only/main_program/contextvae_inference.py  <- this file
-# We climb three levels up to reach <repo_root>, then prepend it to sys.path.
-# This is a soft import shim — it lets us run the server-side code WITHOUT
-# pip-installing the contextvae package and WITHOUT rewriting imports if the
-# repo gets moved. The contextvae package itself is pure-Python with no
-# `setup.py`, so editable-install isn't an option.
+# subdirectory without a pip/editable install (the package has no setup.py).
+# Climb three levels to the repo root and prepend it to sys.path.
 _REPO_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..")
 )
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-# After the sys.path patch above, this import resolves to <repo_root>/contextvae/model.py.
 from contextvae.model import ContextVAE  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# Constants — must match the training config (configs/levelx_train.py).
-# These are intentionally module-level (not config-driven) because the
-# trained checkpoint at tmp/levelx_full_map_v1/ckpt-best was produced with
-# these specific values; changing them here would silently mis-load the
-# model's expected input shape. The values are mirrored verbatim from
-# configs/levelx_train.py as of 2026-05-10.
+# Constants. These MUST match the training config (configs/levelx_train.py)
+# the checkpoint was produced with. They are hard-coded (not config-driven)
+# so a config edited for a later ablation cannot silently mis-shape the
+# model's inputs relative to the loaded weights.
 # ---------------------------------------------------------------------------
 
-# Number of past frames the encoder consumes. 10 frames at 5 Hz = 2 s.
+# Past frames the encoder consumes: 10 at 5 Hz = 2 s.
 OB_HORIZON = 10
 
-# Number of future frames the decoder produces. 25 frames at 5 Hz = 5 s.
+# Future frames the decoder produces: 25 at 5 Hz = 5 s.
 PRED_HORIZON = 25
 
-# Radius-based neighbor filter (meters). Neighbors farther than this from
-# the target at every frame are dropped at encoder time via the distance
-# mask in `contextvae/model.py:306`.
+# Radius-based neighbor filter (meters). The encoder's distance mask drops
+# neighbors beyond this range at every frame.
 OB_RADIUS = 30.0
 
 # Square edge of the final map crop fed to MapEncode (224 x 224 RGB).
 MAP_SIZE = 224
 
-# Half-extent of the pre-rotation map crop (in pixels). Derived in
-# `contextvae/data.py:155` as ceil(MAP_SIZE/4 * sqrt(13)) and stored as
-# `self.EXT`. For MAP_SIZE=224 this works out to 202. We hard-code 202
-# here because the training-time value WAS 202 — re-computing it from
-# a different MAP_SIZE would diverge from the checkpoint's expected
-# crop geometry. The pre-rotation patch is `(3, 2*EXT, 2*EXT) = (3, 404, 404)`,
-# rotated, then sliced down to `(3, 224, 224)` via TOP/BOTTOM/LEFT/RIGHT
-# offsets — see `_extract_rotated_map_crop` below.
+# Half-extent of the pre-rotation map crop (pixels), matching `self.EXT` in
+# contextvae/data.py (ceil(MAP_SIZE/4 * sqrt(13)) = 202 for MAP_SIZE=224).
+# Hard-coded to the training-time value so the crop geometry matches the
+# checkpoint. The pre-rotation patch is (3, 2*EXT, 2*EXT) = (3, 404, 404);
+# after rotation it is sliced to (3, 224, 224) via the offsets below.
 EXT = 202
 
-# Asymmetric crop offsets after the rotation step (in pixels). LEFT < RIGHT
-# is INTENTIONAL — after rotation, the agent's forward heading points
-# along +x, and we want MORE map context in front of the agent than behind.
-# Mirrors `contextvae/data.py:153-163`:
-#     TOP    = MAP_SIZE // 2 = 112      (vertically centered)
-#     LEFT   = MAP_SIZE // 4 = 56       (1/4 of width behind agent)
-#     BOTTOM = MAP_SIZE - TOP = 112     (vertically centered)
-#     RIGHT  = MAP_SIZE - LEFT = 168    (3/4 of width in front of agent)
-#     Then offset by EXT to index into the 2*EXT-wide rotated patch.
+# Asymmetric crop offsets applied after rotation. LEFT < RIGHT is intentional:
+# once rotated, the agent's forward heading points along +x, and we want more
+# map context ahead of the agent than behind (56 px behind, 168 px ahead).
+# Mirrors the TOP/BOTTOM/LEFT/RIGHT slice in contextvae/data.py, offset by EXT
+# to index into the 2*EXT-wide rotated patch.
 _CROP_TOP    = EXT - MAP_SIZE // 2          # 90
 _CROP_BOTTOM = EXT + (MAP_SIZE - MAP_SIZE // 2)  # 314
 _CROP_LEFT   = EXT - MAP_SIZE // 4          # 146
 _CROP_RIGHT  = EXT + (MAP_SIZE - MAP_SIZE // 4)  # 370
 
-# Default K. The training run used pred_samples=5; we mirror it so that
-# the server's per-frame inference cost matches what was measured in
-# the offline eval.
+# Default number of decoder samples, matching the training run's pred_samples
+# so server-side latency tracks the offline eval.
 DEFAULT_K_SAMPLES = 5
 
-# How many future steps the Ntousis socket protocol returns to the UAV.
-# The LSTM at scene_recog_socket_yolov8.py:583-594 returns 6 steps; we
-# truncate ContextVAE's 25-step output to the first 6 steps to keep the
-# wire protocol byte-compatible. (Week 4 may extend the protocol to
-# carry more steps + multi-modal samples.)
+# Future steps returned to the UAV over the socket protocol. The original LSTM
+# returned 6; ContextVAE's 25-step output is truncated to the first 6 to keep
+# the wire protocol byte-compatible with the onboard guidance interface.
 PROTOCOL_FUTURE_STEPS = 6
 
-# Sentinel value used to pad absent neighbor slots so the radius mask
-# (`dist <= ob_radius`) filters them out. Lifted from
-# `contextvae/data.py:262`. ZERO-PADDING IS WRONG — it would put fake
+# Sentinel for absent neighbor slots. Chosen so the radius mask
+# (dist <= ob_radius) filters them out; zero-padding would place fake
 # neighbors at the origin and corrupt social attention.
 NEIGHBOR_PAD_VALUE = 1.0e9
 
-# Hard cap on the number of neighbor slots fed to the encoder. The
-# encoder is per-agent attention so it scales with Nn, but we don't want
-# unbounded Nn growth when a crowded intersection produces dozens of
-# tracks at once. 12 was the original Lyft/Waymo ballpark in the paper
-# supplementary; for inD/uniD crowds it's loose enough not to truncate.
+# Hard cap on neighbor slots. Attention cost scales with Nn, so this bounds
+# per-frame cost in crowded scenes. Loose enough not to truncate typical
+# inD/uniD intersections.
 MAX_NEIGHBORS = 12
 
-
-# ---------------------------------------------------------------------------
-# Module
-# ---------------------------------------------------------------------------
 
 class ContextVAEInferencer:
     """
     Wraps a trained ContextVAE checkpoint for single-target streaming
     inference.
 
-    One instance is created per server connection. The model and map
-    raster are loaded ONCE at construction; `infer(...)` is then called
+    One instance per server connection. The model and map raster are loaded
+    once at construction; `infer(...)` / `infer_samples(...)` are then called
     per frame.
 
-    Thread-safety: the underlying torch model is NOT thread-safe (parameter
-    flatten_parameters() mutates state). Use one Inferencer per worker
-    thread, or guard `infer(...)` with an external mutex if sharing across
-    threads.
+    Thread-safety: the underlying torch model is not thread-safe
+    (flatten_parameters mutates state). Use one inferencer per worker thread,
+    or guard the infer calls with an external mutex.
     """
 
     def __init__(
@@ -215,127 +172,86 @@ class ContextVAEInferencer:
         k_samples: int = DEFAULT_K_SAMPLES,
         model_overrides: Optional[Dict] = None,
     ):
-        # `map_pickle_path=None` is legal for no-map checkpoints (the S-ATTN-
-        # only variant trained without M-ATTN). When None, the inferencer
-        # skips the map pickle load and passes `map=None` to the model;
-        # `ContextVAE.enc()` already takes the no-map branch in that case
-        # (see contextvae/model.py:279 — `use_map = map is not None and
-        # self.use_map`). The caller is responsible for matching the
-        # checkpoint's training config: passing `model_overrides={"map_model": None}`
-        # alongside `map_pickle_path=None` is the canonical no-map setup.
-        # --- Resolve device -------------------------------------------------
-        # We default to CUDA if available — the server box is the A40 host,
-        # and ContextVAE inference fits comfortably in <1 GB of VRAM, so
-        # there's no reason to leave the GPU idle. Caller can override with
-        # device="cpu" for unit-testing on machines without CUDA.
+        # `map_pickle_path=None` selects no-map (S-ATTN-only) mode: the map
+        # pickle is skipped and `map=None` is passed to the model, which takes
+        # ContextVAE.enc()'s no-map branch. The caller must match the
+        # checkpoint by also passing `model_overrides={"map_model": None}`;
+        # a mismatch is caught (loudly) by load_state_dict below.
+        #
+        # Default to CUDA when available (inference fits in <1 GB VRAM);
+        # pass device="cpu" to test on machines without CUDA.
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
         self.k_samples = int(k_samples)
 
-        # One-shot warning latch for the heading-fallback path in `infer()`.
-        # When a caller invokes `infer(...)` WITHOUT supplying `heading_world`,
-        # we approximate heading via finite-difference (atan2) over the first
-        # two obs positions. For stationary/slow agents this collapses to 0
-        # and the M-ATTN encoder receives an un-rotated map crop it never
-        # saw during training — a silent degradation. We warn the first time
-        # this happens per instance so the caller is on notice; subsequent
-        # calls in the degraded mode stay quiet to avoid log spam.
+        # One-shot latch for the heading-fallback warning in `infer()`
+        # (fired the first time a caller omits `heading_world`).
         self._heading_fallback_warned = False
 
         # --- Load the config file -------------------------------------------
-        # The training-side configs are plain Python files (not YAML/JSON).
-        # We load them with importlib so we can read `config.model` (the
-        # ContextVAE constructor kwargs) without hard-coding them. This
-        # mirrors `contextvae/main.py:36-42` verbatim — keep the two in
-        # sync if main.py ever changes its config-loading scheme.
+        # Training-side configs are plain Python modules. Load via importlib
+        # so we can read `config.model` (the ContextVAE constructor kwargs)
+        # without hard-coding them, mirroring contextvae/main.py.
         spec = importlib.util.spec_from_file_location(
             "contextvae_inference_config",  # synthetic module name
             config_path,
             submodule_search_locations=[os.path.dirname(config_path)],
         )
         self._config = importlib.util.module_from_spec(spec)
-        # Register in sys.modules BEFORE exec so configs that inherit via a
-        # relative import (e.g. visdrone_eval_5s.py's `from .levelx_train
-        # import *`) can resolve their parent package — `.` resolves to this
-        # module's name, which must be importable. main.py:41 and
-        # eval_perseq.py:47 do the same; keep in sync.
+        # Register in sys.modules before exec so configs that inherit via a
+        # relative import (e.g. `from .levelx_train import *`) can resolve
+        # their parent package.
         sys.modules[spec.name] = self._config
         spec.loader.exec_module(self._config)
 
         # --- Instantiate the model ------------------------------------------
-        # config.model is a dict like:
-        #     {"horizon": 25, "ob_radius": 30, "hidden_dim": 512, "map_model": "resnet18"}
-        # The headline checkpoint at tmp/levelx_full_map_v1/ckpt-best was
-        # trained with map_model="resnet18". The training-side config file
-        # is user-mutable for ablations — at the time of writing it had been
-        # toggled to map_model=None for a no-map re-eval. We accept a
-        # `model_overrides` dict so callers can pin the architecture to
-        # what matches the checkpoint regardless of the config file's
-        # current contents. If the resulting kwargs don't match the
-        # checkpoint, `load_state_dict` below will fail with shape
-        # mismatches — that's the intended "fail loud" behavior.
+        # config.model is the ContextVAE kwargs dict (horizon, ob_radius,
+        # hidden_dim, map_model, ...). Since the config file is edited across
+        # ablations, `model_overrides` lets callers pin the architecture to
+        # match the checkpoint regardless of the file's current contents. A
+        # mismatch surfaces as a shape error in load_state_dict below.
         model_kwargs = dict(self._config.model)
         if model_overrides:
             model_kwargs.update(model_overrides)
         self.model = ContextVAE(**model_kwargs)
-        self._model_kwargs = model_kwargs  # kept for debug/logging
+        self._model_kwargs = model_kwargs  # kept for logging
 
         # --- Load the trained weights ---------------------------------------
-        # Mirrors `contextvae/main.py:140-141`:
-        #     state_dict = torch.load(ckpt_path, map_location=device)
-        #     model.load_state_dict(state_dict["model"])
-        # The ckpt file is a torch-pickled dict with keys
-        #     {"model", "ade", "fde", "ade_d", "fde_d", "epoch", "rng_state"}
-        # We only need "model" for inference. map_location handles the
-        # case where the ckpt was saved on cuda:0 but we're loading on a
-        # different device (cuda vs cpu).
+        # The ckpt is a torch-pickled dict {"model", "ade", "fde", "epoch",
+        # ...}; only "model" is needed for inference. map_location handles a
+        # ckpt saved on a different device than we load on.
         state = torch.load(ckpt_path, map_location=self.device)
         self.model.load_state_dict(state["model"])
         self.model.to(self.device)
-        # eval() disables dropout (including the map-input dropout in
-        # `contextvae/model.py:338-339`) and switches BN to running stats.
-        # Failing to call eval() here would inject training noise into every
-        # server-side prediction.
+        # eval() disables dropout (incl. the map-input dropout) and switches
+        # BN to running stats; without it, training noise would leak into
+        # every server-side prediction.
         self.model.eval()
-        # Log what we loaded so server-startup logs make the version explicit.
+        # Record ckpt metadata so startup logs state the loaded version.
         self._loaded_epoch = state.get("epoch", -1)
         self._loaded_ade = state.get("ade", float("nan"))
         self._loaded_fde = state.get("fde", float("nan"))
 
         # --- Load the map raster (optional) ---------------------------------
-        # The pickle is `(semantic_map_ndarray, H_ndarray)` matching
-        # `contextvae/data.py:530-538` (`load_map`). We hold both on the
-        # target device so the affine crop runs without per-frame H2D copy.
-        # semantic_map: (3, H_full, W_full) in [-1, 1]
-        # H: (3, 3) — world (x, y, 1) -> image (row, col, 1)
-        #
-        # When `map_pickle_path` is None the inferencer is in NO-MAP mode:
-        # the model receives `map=None` per inference and `ContextVAE.enc()`
-        # takes its no-map branch (see contextvae/model.py:351-353). The
-        # caller MUST also set `model_overrides={"map_model": None}` so that
-        # the model is built without the MapEncode sub-module — otherwise the
-        # checkpoint state_dict won't match. We do NOT enforce that here at
-        # construction (an explicit check would couple us to the config-file
-        # contents); the state_dict load below will fail loud if the
-        # combination is mismatched.
+        # Pickle is `(semantic_map, H)` per contextvae/data.py's load_map:
+        #   semantic_map: (3, H_full, W_full) in [-1, 1]
+        #   H: (3, 3) mapping world (x, y, 1) -> image (row, col, 1)
+        # The map is held on-device so the affine crop avoids a per-frame H2D
+        # copy. When map_pickle_path is None, no-map mode is active (see note
+        # in the __init__ signature above).
         if map_pickle_path is not None:
             with open(map_pickle_path, "rb") as f:
                 sem_map_np, H_np = pickle.load(f)
-            # semantic_map is loaded as float32 (data.py stores it that way
-            # after the preprocessing notebook). torch.tensor(..., dtype=
-            # float32) makes it explicit in case a future pickle ships a
-            # different dtype.
+            # Force float32 in case a future pickle ships another dtype.
             self._semantic_map = torch.tensor(
                 sem_map_np, dtype=torch.float32, device=self.device
             )
-            # H is a numpy 3x3 ndarray. We keep it numpy because the only
-            # operation we do with it is a single `H @ [x, y, 1]` per
-            # inference call (fast on CPU; not worth a GPU round-trip).
+            # Keep H on CPU as numpy: it is used only for a single
+            # `H @ [x, y, 1]` per call — not worth a GPU round-trip.
             self._H = np.asarray(H_np, dtype=np.float64)
 
-            # Sanity-check shapes — fail loud at construction rather than
-            # during the first infer() call.
+            # Fail loud at construction, not on the first infer() call.
             assert self._semantic_map.dim() == 3 and self._semantic_map.size(0) == 3, (
                 f"map pickle has unexpected shape {self._semantic_map.shape}; "
                 "expected (3, H, W)"
@@ -344,10 +260,8 @@ class ContextVAEInferencer:
                 f"map pickle H has unexpected shape {self._H.shape}; expected (3, 3)"
             )
         else:
-            # No-map mode. Both attributes still exist (so attribute access
-            # downstream doesn't AttributeError) — they just take the
-            # sentinel value None, which `_run_forward` checks before
-            # invoking `_build_map_tensor`.
+            # No-map mode: attributes still exist (None sentinel) so downstream
+            # access doesn't raise; _run_forward checks for None before cropping.
             self._semantic_map = None
             self._H = None
 
@@ -365,16 +279,13 @@ class ContextVAEInferencer:
         """
         Shared forward pass for `infer()` and `infer_samples()`.
 
-        Performs steps 0-7 of the original `infer()` body: validate, compute
-        heading, build the localization rotation, build the model tensors,
-        and call the model. Returns the raw K-sample prediction in the
-        LOCALIZED frame plus the (pivot, R) pair needed to un-localize.
-
-        Callers are responsible for the K-collapse (or not), the un-rotation,
-        and any output truncation. This split exists so `infer()` (the
-        socket-protocol entry point) and `infer_samples()` (the replay-driver
-        entry point) share identical model-input construction with zero
-        risk of drift.
+        Validates inputs, computes heading, builds the localization rotation
+        and the model tensors, and calls the model. Returns the raw K-sample
+        prediction in the LOCALIZED frame plus the (pivot, R) pair needed to
+        un-localize. Callers handle K-collapse (or not), un-rotation, and any
+        truncation. Splitting this out keeps the socket entry point `infer()`
+        and the replay entry point `infer_samples()` on identical model-input
+        construction.
 
         Returns
         -------
@@ -389,9 +300,8 @@ class ContextVAEInferencer:
             un-rotates back to the original world frame.
         """
         # --- 0. Validate inputs --------------------------------------------
-        # Cheap shape checks. The model would eventually fail with a less
-        # informative error if these are wrong (e.g. RuntimeError on a tensor
-        # reshape inside the encoder); fail at the boundary instead.
+        # Cheap shape check at the boundary; without it a bad shape would fail
+        # later inside the encoder with a less informative error.
         target_history_metric = np.asarray(target_history_metric, dtype=np.float64)
         if target_history_metric.shape != (OB_HORIZON, 2):
             raise ValueError(
@@ -400,27 +310,18 @@ class ContextVAEInferencer:
             )
 
         # --- 1. Compute heading at the first obs frame ---------------------
-        # ContextVAE's training-time localization uses the heading at the
-        # FIRST obs frame (see contextvae/data.py:468 — `heading` is read
-        # from the agent's data at `first_frame[idx][1]` which corresponds
-        # to tid_start). We mirror that at inference time.
+        # Training-time localization uses the heading at the FIRST obs frame.
+        # Preferred: the caller supplies `heading_world` (radians, world
+        # frame) from the same source training used — the preprocessed .txt
+        # heading column, or a DeepSORT bbox-displacement estimate over a
+        # multi-step window. Used verbatim to match training.
         #
-        # Preferred path: the caller supplies `heading_world` (radians, world
-        # frame) directly — typically pulled from the same source training
-        # used (the preprocessed .txt heading column, or a robust DeepSORT-
-        # bbox-displacement estimate over a window > 1 step). When supplied,
-        # we use it verbatim, eliminating the train/infer drift documented
-        # by the heading-source audit.
-        #
-        # Fallback path: when `heading_world` is None we approximate heading
-        # via first-order finite difference `atan2(v0_y, v0_x)` over the
-        # first two obs positions. For stationary/slow agents the velocity
-        # vector is ~zero and atan2 returns 0 (atan2(0, 0) == 0 by IEEE 754
-        # / Python convention). The map crop is then axis-aligned with the
-        # WORLD frame rather than the AGENT frame — a distribution the
-        # M-ATTN encoder never saw at training time, degrading predictions.
-        # We emit a one-shot warning per inferencer instance so the caller
-        # is on notice; subsequent fallback calls stay quiet to avoid spam.
+        # Fallback (heading_world is None): approximate via finite difference
+        # atan2(v0_y, v0_x) over the first two obs positions. For
+        # stationary/slow agents this collapses to 0, so the map crop is
+        # axis-aligned to the world frame rather than the agent frame — a
+        # distribution the M-ATTN encoder never saw, degrading predictions.
+        # Warn once per instance; stay quiet afterward to avoid log spam.
         if heading_world is not None:
             heading = float(heading_world)
         else:
@@ -442,31 +343,27 @@ class ContextVAEInferencer:
             v0 = target_history_metric[1] - target_history_metric[0]
             heading = math.atan2(v0[1], v0[0])  # radians, world frame
 
-        # The rotation angle stored in `__getitem__` is `-heading` (see
-        # data.py:495). We carry the same sign here so the rotation logic
-        # below mirrors training.
+        # Training's loader stores the rotation angle as -heading; match the
+        # sign so the rotation below mirrors it.
         angle = -heading
 
         # --- 2. Pivot for the localization rotation ------------------------
-        # The pivot is the FIRST obs frame position. Mirrors data.py:505-506
-        # (`x0 = hist[0][0]; y0 = hist[0][1]`). After rotation around this
-        # pivot, `target_history[0]` is unchanged and `target_history[1:]`
-        # is rotated. World coordinates are preserved — we do NOT translate
-        # the origin to (x0, y0).
+        # Pivot = first obs-frame position. After rotating the scene around
+        # it, target[0] is unchanged and target[1:] is rotated; world
+        # coordinates are preserved (origin is not translated to the pivot).
         pivot_xy = target_history_metric[0].copy()  # shape (2,)
 
         # --- 3. Apply the localization rotation ----------------------------
-        # Mirrors data.py:507-521. The trick (subtract pivot -> rotate ->
-        # add pivot back) rotates around the pivot while keeping world coords.
+        # Subtract pivot -> rotate -> add pivot back: rotates about the pivot
+        # while keeping world coordinates.
         sin_a = math.sin(angle)
         cos_a = math.cos(angle)
         R = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float64)  # (2, 2)
 
         target_loc = self._rotate_around_pivot(target_history_metric, pivot_xy, R)
 
-        # Same rotation applied to each neighbor's (OB_HORIZON, 2) array.
-        # We keep them as a dict here; collation into the model tensor
-        # happens in step 5.
+        # Rotate each neighbor history by the same R; kept as a dict here and
+        # collated into the model tensor in step 5.
         neighbors_loc = {
             tid: self._rotate_around_pivot(
                 np.asarray(hist, dtype=np.float64), pivot_xy, R
@@ -475,13 +372,10 @@ class ContextVAEInferencer:
         }
 
         # --- 4. Build the target's 6-D state tensor ------------------------
-        # Model expects (OB_HORIZON, N=1, 6) where the 6 channels are
-        # (x, y, vx, vy, ax, ay). Per `contextvae/model.py:294-296` the
-        # encoder recomputes v from positions and only reads `state[1, ..., 4:6]`
-        # for the first acceleration — so the vx/vy fields of the target's
-        # state tensor are effectively ignored, but we fill them anyway with
-        # finite differences for consistency and to make the code path
-        # observable in a debugger.
+        # Model expects (OB_HORIZON, N=1, 6) with channels (x, y, vx, vy, ax,
+        # ay). The encoder recomputes velocity from positions and reads only
+        # the first acceleration (state[1, :, 4:6]); the other derived
+        # channels are inert but filled for format parity and debuggability.
         target_state_6d = self._positions_to_6d_state(target_loc)  # (10, 6)
         x_tensor = torch.tensor(
             target_state_6d[:, None, :],  # add the N=1 batch dim
@@ -490,34 +384,22 @@ class ContextVAEInferencer:
         )
 
         # --- 5. Build the neighbor tensor ----------------------------------
-        # Shape: (OB_HORIZON + PRED_HORIZON, N=1, Nn, 6). The future
-        # OB_HORIZON..OB_HORIZON+PRED_HORIZON-1 frames are filled with
-        # NEIGHBOR_PAD_VALUE (=1e9), since we don't know future neighbor
-        # positions at inference time. The encoder's distance mask filters
-        # them out.
+        # Shape (OB_HORIZON + PRED_HORIZON, N=1, Nn, 6). Future frames are
+        # padded with NEIGHBOR_PAD_VALUE (unknown at inference); the encoder's
+        # distance mask filters them. See _build_neighbor_tensor.
         neighbor_tensor = self._build_neighbor_tensor(
             target_loc=target_loc,
             neighbors_loc=neighbors_loc,
         )  # (35, 1, Nn, 6) float32
 
         # --- 6. Build the map tensor ---------------------------------------
-        # Two-step build, mirroring contextvae/data.py:
-        #   (a) Crop a (3, 2*EXT, 2*EXT) patch from the full raster centered
-        #       at the pre-rotation pivot pixel `(r, c) = H @ (x0, y0, 1)`.
-        #       This is the SAME pivot we used in step 2 (the first obs
-        #       frame), because data.py:357 does the same thing.
-        #   (b) Apply affine_grid + grid_sample with the same `angle` we
-        #       used in step 3, then crop down to (3, MAP_SIZE, MAP_SIZE)
-        #       with the asymmetric TOP/BOTTOM/LEFT/RIGHT slice that
-        #       biases the crop forward of the agent.
-        # Output shape: (N=1, 3, MAP_SIZE, MAP_SIZE), then unsqueezed at
-        # dim=0 to match training-time (1, N, 3, H, W).
-        #
-        # When the inferencer is in no-map mode (`self._semantic_map is None`)
-        # we skip the crop entirely and pass `map_tensor = None` to the model.
-        # `ContextVAE.enc()` takes its no-map branch in that case — see
-        # contextvae/model.py:351-353. The neighbor + S-ATTN path is
-        # unaffected.
+        # Two-stage build mirroring contextvae/data.py: (a) crop a
+        # (3, 2*EXT, 2*EXT) patch centered at the pivot pixel H @ (x0, y0, 1);
+        # (b) rotate by `angle` via affine_grid/grid_sample, then slice to
+        # (3, MAP_SIZE, MAP_SIZE) with the forward-biased asymmetric crop.
+        # Output (N=1, 3, MAP_SIZE, MAP_SIZE), unsqueezed to the training-time
+        # (1, N, 3, H, W) layout. In no-map mode we pass map_tensor=None and
+        # the encoder takes its no-map branch (S-ATTN path unaffected).
         if self._semantic_map is not None:
             map_tensor = self._build_map_tensor(
                 pivot_xy=pivot_xy, angle=angle
@@ -526,26 +408,21 @@ class ContextVAEInferencer:
             map_tensor = None
 
         # --- 7. Call the model ---------------------------------------------
-        # The model's forward signature for eval mode (model.training=False,
-        # n_predictions>0) is `(x, neighbor, map, n_predictions=K)` and it
-        # returns `(K, PRED_HORIZON, N, 2)`. See contextvae/model.py:385-478.
-        # We pass map and skip seq_len (None / default) because OB_HORIZON
-        # frames are always available at inference — there's no pad-mode.
+        # Eval-mode forward (x, neighbor, map, n_predictions=K) returns
+        # (K, PRED_HORIZON, N, 2). seq_len is left default: at inference all
+        # OB_HORIZON frames are present, so there is no pad-mode.
         pred = self.model(
             x_tensor,
             neighbor_tensor,
             map_tensor,
             n_predictions=self.k_samples,
         )
-        # pred: (K, 25, 1, 2) — K samples of 25 future (delta-x, delta-y)
-        # pairs already accumulated by `torch.cumsum` and shifted by `x_T`
-        # inside the model (see model.py:473-476). So pred is in the SAME
-        # frame as x_tensor — i.e. world coords rotated around pivot_xy by
-        # `angle = -heading`.
+        # pred: (K, 25, 1, 2). The model already accumulates (cumsum) and
+        # shifts by x_T, so pred is absolute positions in the SAME localized
+        # frame as x_tensor (world coords rotated about pivot_xy by `angle`).
 
-        # Squeeze the N=1 batch axis and convert to numpy float64 so all
-        # downstream geometry stays in numpy (matches the rest of the
-        # localization plumbing in this module).
+        # Drop the N=1 axis and convert to numpy float64 so all downstream
+        # geometry stays in numpy, matching the rest of this module.
         pred_np = pred.squeeze(2).cpu().numpy().astype(np.float64)  # (K, 25, 2)
         return pred_np, pivot_xy, R
 
@@ -559,10 +436,10 @@ class ContextVAEInferencer:
         Run one inference step and return the next `PROTOCOL_FUTURE_STEPS`
         future positions of the target (mean over K samples).
 
-        This is the SOCKET-PROTOCOL entry point. The Ntousis wire protocol
-        expects a single (6, 2) trajectory, so we collapse the K samples
-        to their mean and truncate to the first 6 steps. For multi-modal
-        rendering, use `infer_samples()` instead.
+        This is the socket-protocol entry point. The wire protocol expects a
+        single (6, 2) trajectory, so the K samples are mean-collapsed and
+        truncated to the first 6 steps. For multi-modal rendering, use
+        `infer_samples()` instead.
 
         Parameters
         ----------
@@ -575,17 +452,14 @@ class ContextVAEInferencer:
             Empty dict is allowed (means no neighbors visible).
         heading_world : Optional[float], default None
             Target heading at the FIRST obs frame, in RADIANS, world frame
-            (i.e. atan2-convention angle from +x). When provided, this is
-            used VERBATIM for the localization rotation and map crop, exactly
-            matching the training-time loader (which reads `heading` from the
-            preprocessed .txt — see contextvae/data.py:468). When None, we
-            fall back to a finite-difference approximation `atan2(v0_y, v0_x)`
-            over the first two obs positions and emit a one-shot warning;
-            for stationary/slow agents this fallback collapses to 0 and the
-            M-ATTN encoder receives an un-rotated crop it never saw in
-            training. Callers with access to a real heading (e.g. via the
-            preprocessed .txt heading column, or DeepSORT bbox displacement
-            over a longer history) SHOULD pass it here.
+            (atan2-convention angle from +x). When provided, used verbatim for
+            the localization rotation and map crop, matching the training-time
+            loader (which reads the stored `heading`). When None, falls back to
+            atan2(v0_y, v0_x) over the first two obs positions and emits a
+            one-shot warning; for stationary/slow agents this collapses to 0
+            and the M-ATTN encoder receives an un-rotated crop it never saw in
+            training. Callers with a real heading (preprocessed .txt column, or
+            DeepSORT bbox displacement over a longer history) should pass it.
 
         Returns
         -------
@@ -600,15 +474,13 @@ class ContextVAEInferencer:
             heading_world=heading_world,
         )  # (K, 25, 2), (2,), (2, 2)
 
-        # Collapse K samples to single mean trajectory and un-localize.
-        # We mean over the K axis. This is the simplest "single-prediction
-        # output" strategy and the one called for by the Week-3 Day-1-2 scope.
+        # Mean-collapse over K and un-localize (R.T inverts the localization
+        # rotation).
         pred_mean = pred_loc.mean(axis=0)  # (25, 2)
-        R_inv = R.T  # inverse of the rotation applied during localization
+        R_inv = R.T
         pred_unloc = self._rotate_around_pivot(pred_mean, pivot_xy, R_inv)
 
-        # Truncate to the first PROTOCOL_FUTURE_STEPS. The Ntousis wire
-        # protocol sends 6 future steps; ContextVAE produces 25.
+        # Truncate 25 -> 6 for the wire protocol.
         return pred_unloc[:PROTOCOL_FUTURE_STEPS]
 
     def infer_samples(
@@ -620,17 +492,13 @@ class ContextVAEInferencer:
         """
         Run one inference step and return ALL K sample trajectories.
 
-        This is the REPLAY-DRIVER entry point — used by offline tooling
-        (e.g. `replay_video.py`) that needs the full multi-modal output
-        rather than the mean-collapsed one the socket protocol carries.
+        This is the replay-driver entry point — used by offline tooling (e.g.
+        `replay_video.py`) that needs the full multi-modal output rather than
+        the mean-collapsed trajectory the socket protocol carries.
 
-        Same input contract as `infer()`. Differs in two ways from `infer()`:
-
-          - Returns the full `K` samples (no mean collapse) so callers can
-            visualize multi-modality.
-          - Returns the full `PRED_HORIZON` (25 steps = 5 s) rather than
-            the protocol-truncated 6. Replay overlays benefit from the
-            longer horizon, and there's no wire-protocol constraint here.
+        Same input contract as `infer()`, but returns all K samples (no mean
+        collapse) over the full PRED_HORIZON (25 steps = 5 s) rather than the
+        protocol-truncated 6 — there is no wire-protocol constraint here.
 
         Returns
         -------
@@ -646,9 +514,8 @@ class ContextVAEInferencer:
             heading_world=heading_world,
         )  # (K, 25, 2), (2,), (2, 2)
 
-        # Un-localize each of the K trajectories. `_rotate_around_pivot`
-        # already handles arbitrary leading dims via `np.einsum`, so we
-        # can pass the whole (K, 25, 2) tensor at once.
+        # Un-localize all K trajectories at once (_rotate_around_pivot handles
+        # arbitrary leading dims via einsum).
         R_inv = R.T
         pred_unloc = self._rotate_around_pivot(pred_loc, pivot_xy, R_inv)
         return pred_unloc  # (K, 25, 2)
@@ -662,11 +529,8 @@ class ContextVAEInferencer:
         points_xy: np.ndarray, pivot_xy: np.ndarray, R: np.ndarray
     ) -> np.ndarray:
         """
-        Rotate a (..., 2) array of points around `pivot_xy` by the 2x2
-        rotation matrix `R`. World coordinates are preserved (we subtract
-        the pivot, rotate, add the pivot back).
-
-        Mirrors the trick in contextvae/data.py:513-521.
+        Rotate a (..., 2) array of points about `pivot_xy` by the 2x2 matrix
+        `R`, preserving world coordinates (subtract pivot, rotate, add back).
 
         Shapes
         ------
@@ -675,13 +539,8 @@ class ContextVAEInferencer:
         R         : (2, 2)
         returns   : same shape as points_xy
         """
-        # Broadcasting: pivot_xy is shape (2,); subtracting from points_xy
-        # (shape (..., 2)) broadcasts pivot across the leading dims.
         centered = points_xy - pivot_xy
-        # The matmul `R @ p` for a column vector p; we work on the last
-        # axis with einsum to avoid reshaping. R has shape (2, 2),
-        # centered has shape (..., 2) — einsum contracts R's columns with
-        # centered's last axis.
+        # einsum applies R @ p along the last axis without reshaping.
         rotated = np.einsum("ij,...j->...i", R, centered)
         return rotated + pivot_xy
 
@@ -692,48 +551,38 @@ class ContextVAEInferencer:
         (OB_HORIZON, 6) state tensor `(x, y, vx, vy, ax, ay)` that
         ContextVAE expects.
 
-        Velocity and acceleration use first-order finite differences in
-        UNITS OF METERS PER TIMESTEP (NOT m/s). This matches the training
-        convention computed inside contextvae/data.py's `extend()`. The
-        Ntousis-LSTM comparison in Week 4 will need an explicit *5 to
-        convert these to m/s (at the 5 Hz cadence).
+        Velocity and acceleration are first-order finite differences in units
+        of meters-per-timestep (NOT m/s), matching the training convention in
+        contextvae/data.py's `extend()`. (Converting to m/s requires *5 at the
+        5 Hz cadence — relevant only for the LSTM-baseline comparison.)
 
-        First-frame velocity is copied from frame 1 (so v[0] == v[1]),
-        and first-two-frame accelerations are copied from frame 2
-        (so a[0] == a[1] == a[2]). This mirrors the cold-start handling
-        in contextvae/data.py:577-579 and :595-598 — at the start of an
-        agent's trajectory, finite differences below the relevant order
-        aren't well-defined, so the loader copies the next available value.
+        Cold-start handling mirrors the loader: first-frame velocity copies
+        frame 1 (v[0] == v[1]), and the first two accelerations copy frame 2
+        (a[0] == a[1] == a[2]), since lower-order finite differences at the
+        start of a trajectory are undefined.
 
-        Note: the encoder recomputes v from positions and only reads
-        state[1, :, 4:6] for the first acceleration (model.py:294-296).
-        So the only state slot the model actually consumes from this
-        return value is `state[1, 4:6] = (ax_1, ay_1)`. The other 4-channel
-        entries (vx, vy, ax_others, ay_others) are inert for the target,
-        but we fill them all for consistency with the training-time format
-        and to keep the code observable.
+        The encoder recomputes velocity from positions and reads only the
+        first acceleration (state[1, 4:6]); the other derived channels are
+        inert for the target but filled for format parity and debuggability.
         """
         T = positions.shape[0]
         out = np.zeros((T, 6), dtype=np.float64)
         out[:, 0:2] = positions
 
-        # Velocity: vx_t = x_t - x_{t-1}, with vx_0 := vx_1.
-        # `np.diff` along axis 0 returns shape (T-1, 2); we shift it into
-        # rows [1:] of `v` and fill row 0 from row 1.
+        # Velocity v_t = pos_t - pos_{t-1}, with v[0] := v[1].
         v = np.zeros_like(positions)
         v[1:] = np.diff(positions, axis=0)
         v[0] = v[1]  # cold-start copy
         out[:, 2:4] = v
 
-        # Acceleration: ax_t = vx_t - vx_{t-1}, with ax_0 := ax_1 := ax_2.
+        # Acceleration a_t = v_t - v_{t-1}, with a[0] := a[1] := a[2].
         a = np.zeros_like(positions)
         if T >= 3:
-            a[2:] = np.diff(v[1:], axis=0)  # length T-2, fills rows 2..T-1
+            a[2:] = np.diff(v[1:], axis=0)  # fills rows 2..T-1
             a[1] = a[2]
             a[0] = a[2]
         elif T >= 2:
-            # Degenerate case (history shorter than expected). Should not
-            # happen at the contract-validated OB_HORIZON=10 but kept defensive.
+            # Defensive: should not happen at the validated OB_HORIZON=10.
             a[:] = 0.0
         out[:, 4:6] = a
 
@@ -749,62 +598,46 @@ class ContextVAEInferencer:
 
         Contract
         --------
-        - Frames `[0 .. OB_HORIZON-1]` carry the actual neighbor histories
-          (computed 6-D state, same convention as the target).
-        - Frames `[OB_HORIZON .. OB_HORIZON+PRED_HORIZON-1]` are filled with
-          `NEIGHBOR_PAD_VALUE = 1e9` — the encoder's distance mask filters
-          these out as far-away.
-        - Neighbors farther than `OB_RADIUS` from the target at every obs
-          frame are pre-filtered here (so the encoder doesn't waste budget
-          on them). Mirrors contextvae/data.py:473-478.
-        - The slot dimension `Nn` is padded with `1e9`-only entries up to
-          `MAX_NEIGHBORS`, matching the training-time padding pattern in
-          contextvae/data.py's collate_fn at lines 257-264.
+        - Frames [0 .. OB_HORIZON) carry actual neighbor histories (6-D state,
+          same convention as the target).
+        - Frames [OB_HORIZON .. OB_HORIZON+PRED_HORIZON) are filled with
+          NEIGHBOR_PAD_VALUE; the encoder's distance mask filters them.
+        - Neighbors beyond OB_RADIUS of the target at every obs frame are
+          pre-filtered here so the encoder doesn't spend budget on them.
+        - The slot dimension Nn is padded with all-1e9 entries up to
+          MAX_NEIGHBORS, matching the loader's collate-time padding.
 
         Why the full L1+L2 window even at inference
         -------------------------------------------
-        At training, the posterior-RNN (`rnn_by`) consumes neighbor states
-        across the FUTURE prediction horizon as well. At inference we only
-        run the prior branch, which does NOT touch the future neighbor
-        slice — but the model's forward path still reads `neighbor[1:]` and
-        slices it, so the tensor must HAVE 35 frames. Skipping the future
-        25 frames would crash with a shape error inside `enc()`.
+        At training the posterior RNN consumes neighbor states over the future
+        horizon. At inference only the prior branch runs (which never touches
+        the future slice), but the forward path still slices neighbor[1:], so
+        the tensor must physically have 35 frames or enc() crashes on shape.
         """
         total_frames = OB_HORIZON + PRED_HORIZON  # 35
 
-        # Step 1: filter neighbors by radius (using the LOCALIZED target
-        # positions, since we localize neighbors to the same frame).
-        # We require the neighbor to be within OB_RADIUS at SOME obs frame.
+        # Step 1: radius-filter neighbors using the localized positions. Keep a
+        # neighbor if it is within OB_RADIUS of the target at ANY obs frame.
         kept_states: list[np.ndarray] = []
         for _tid, hist in neighbors_loc.items():
-            # Pairwise distance between target and this neighbor at each
-            # obs frame. hist shape (OB_HORIZON, 2), target_loc shape
-            # (OB_HORIZON, 2). dist shape (OB_HORIZON,).
+            # Per-obs-frame target<->neighbor distance; both (OB_HORIZON, 2).
             dist = np.linalg.norm(hist - target_loc, axis=-1)
-            # The contract is "kept if within OB_RADIUS at any obs frame".
-            # Mirrors data.py:476-477:
-            #     valid = dist <= ob_radius     # L x (N-1)
-            #     valid = np.any(valid, axis=0) # N-1
             if np.any(dist <= OB_RADIUS):
                 kept_states.append(self._positions_to_6d_state(hist))
                 if len(kept_states) >= MAX_NEIGHBORS:
-                    # Hard cap. Should be rare in inD/uniD scenes.
-                    break
+                    break  # hard cap; rare in inD/uniD scenes
 
-        # Step 2: assemble the full-window tensor.
-        # Default-initialize EVERYTHING with the pad value, then overlay
-        # the actual obs-window states on top. Future frames remain padded.
-        # nn is the actual neighbor count after radius filtering; we still
-        # always emit MAX_NEIGHBORS slots (with the unused ones all-1e9) so
-        # the model's last-dim shape is constant across calls.
+        # Step 2: assemble the full-window tensor. Initialize everything to the
+        # pad value, then overlay the obs-window states; future frames stay
+        # padded. Always emit MAX_NEIGHBORS slots (unused ones all-1e9) so the
+        # last-dim shape is constant across calls.
         nb = np.full(
             (total_frames, 1, MAX_NEIGHBORS, 6),
             fill_value=NEIGHBOR_PAD_VALUE,
             dtype=np.float32,
         )
         for slot_idx, state6d in enumerate(kept_states):
-            # state6d shape: (OB_HORIZON, 6). Place it in slot `slot_idx`
-            # at frames [0..OB_HORIZON-1]. Batch dim is 0 (N=1).
+            # Place each (OB_HORIZON, 6) state in its slot over the obs frames.
             nb[:OB_HORIZON, 0, slot_idx, :] = state6d.astype(np.float32)
 
         return torch.from_numpy(nb).to(self.device)
@@ -816,27 +649,21 @@ class ContextVAEInferencer:
         Build the map tensor of shape (1, N=1, 3, MAP_SIZE, MAP_SIZE).
 
         Two-stage construction mirrors contextvae/data.py:
-          1. (`__getitem__`, lines 357-366) Pre-rotation pixel crop of size
-             `(3, 2*EXT, 2*EXT)` centered at the agent's first-obs-frame
-             pixel location `(r, c) = H @ (x, y, 1)`.
-          2. (`collate_fn`, lines 300-302) Affine rotation by `angle` via
-             `affine_grid + grid_sample`, then asymmetric slice to
-             `(3, MAP_SIZE, MAP_SIZE)`.
+          1. Pre-rotation pixel crop (3, 2*EXT, 2*EXT) centered at the agent's
+             first-obs-frame pixel (r, c) = H @ (x, y, 1).
+          2. Affine rotation by `angle` via affine_grid + grid_sample, then an
+             asymmetric slice to (3, MAP_SIZE, MAP_SIZE).
 
-        The outer batch dim (the leading `1`) matches the (B, N, 3, H, W)
-        layout the encoder sees during training; the encoder collapses it
-        with .view() in `MapEncode.forward` (see model.py:168-179).
+        The leading 1 matches the (B, N, 3, H, W) layout the encoder expects;
+        MapEncode.forward collapses B and N with .view().
         """
         # --- Stage 1: pre-rotation pixel crop ------------------------------
-        # Apply the homography to the pivot world coords to get the pixel
-        # (row, col) of the agent in the full raster. Matches data.py:358.
-        # The third row of H is `[0, 0, 1]` for an affine, so the divide
-        # by w is a no-op; we still do it for safety in case the pickle
-        # has a non-affine projective.
+        # Homography maps the pivot world coords to the agent's (row, col) in
+        # the full raster. For an affine H the w-divide is a no-op; kept for
+        # safety against a projective pickle.
         x0, y0 = float(pivot_xy[0]), float(pivot_xy[1])
         r_f, c_f, w_f = self._H @ np.array([x0, y0, 1.0], dtype=np.float64)
-        # Guard against the degenerate w=0 case (impossible for our
-        # well-formed H, but fail loud if a future pickle is malformed).
+        # Guard degenerate w=0 (impossible for a well-formed H; fail loud).
         if abs(w_f) < 1e-12:
             raise RuntimeError(
                 f"Map homography produced w=0 for pivot ({x0}, {y0}). "
@@ -845,11 +672,10 @@ class ContextVAEInferencer:
         r = int(np.floor(r_f / w_f))
         c = int(np.floor(c_f / w_f))
 
-        # Slice out (3, 2*EXT, 2*EXT) centered at (r, c). The preprocessing
-        # notebook pre-pads the raster by EXT pixels of -1.0 (see project
-        # memory `project_build_map_pickle_fix.md`), so the slice never
-        # falls off the raster as long as the agent is within the recording's
-        # content bbox. We still bounds-check to fail loud if it does.
+        # Slice (3, 2*EXT, 2*EXT) centered at (r, c). The raster is pre-padded
+        # by EXT px of -1.0 during preprocessing, so the slice stays in bounds
+        # as long as the agent is within the recording's content bbox; the
+        # check below fails loud otherwise.
         H_full, W_full = self._semantic_map.size(-2), self._semantic_map.size(-1)
         if not (EXT <= r <= H_full - EXT and EXT <= c <= W_full - EXT):
             raise RuntimeError(
@@ -859,19 +685,16 @@ class ContextVAEInferencer:
                 "the orthoPxToMeter and origin used in pixel_metric_shim.py."
             )
 
-        # Crop. Shape after slice: (3, 2*EXT, 2*EXT) = (3, 404, 404).
+        # Crop: (3, 2*EXT, 2*EXT) = (3, 404, 404), on-device float32.
         patch = self._semantic_map[
             :, r - EXT : r + EXT, c - EXT : c + EXT
-        ]  # still on self.device, still float32
+        ]
 
         # --- Stage 2: affine_grid rotation + final crop --------------------
-        # Build the (1, 2, 3) rotation matrix for affine_grid. Mirrors
-        # data.py:362-365:
-        #     rot = [[cos, -sin, 0], [sin, cos, 0]]
-        # with the SAME sign convention (angle = -heading_world). Note that
-        # this matrix is INVERSE of the image rotation we want — affine_grid
-        # uses it to compute where in the INPUT to sample for each OUTPUT
-        # pixel, which is the inverse of "rotate the image by angle".
+        # (1, 2, 3) rotation for affine_grid, using the same sign convention
+        # as the loader (angle = -heading). affine_grid maps OUTPUT pixels
+        # back to INPUT sample locations, i.e. it is the inverse of rotating
+        # the image, which is why this form (not its transpose) is correct.
         sin_a = math.sin(angle)
         cos_a = math.cos(angle)
         rot = torch.tensor(
@@ -880,8 +703,7 @@ class ContextVAEInferencer:
             device=self.device,
         )  # (1, 2, 3)
 
-        # `patch.unsqueeze(0)` -> (1, 3, 2*EXT, 2*EXT) — required batch dim
-        # for affine_grid/grid_sample.
+        # affine_grid/grid_sample need a leading batch dim.
         m = patch.unsqueeze(0)
         grid = torch.nn.functional.affine_grid(
             rot, m.size(), align_corners=False
@@ -889,37 +711,27 @@ class ContextVAEInferencer:
         m = torch.nn.functional.grid_sample(
             m, grid, align_corners=False
         )  # (1, 3, 2*EXT, 2*EXT)
-        # Final asymmetric slice to (1, 3, MAP_SIZE, MAP_SIZE). The asymmetry
-        # (LEFT=56, RIGHT=168) gives the model more pixels in front of the
-        # agent than behind.
+        # Asymmetric slice to (1, 3, MAP_SIZE, MAP_SIZE): more pixels ahead of
+        # the agent than behind.
         m = m[..., _CROP_TOP:_CROP_BOTTOM, _CROP_LEFT:_CROP_RIGHT]
 
-        # data.py:310 does `m.unsqueeze_(0)` to insert the leading "1" the
-        # model expects (because the encoder reshapes (B, N, 3, H, W) to
-        # (B*N, 3, H, W) in MapEncode.forward). At inference N=1, so the
-        # leading-1 is fine.
+        # Add the leading 1 the encoder expects before it reshapes
+        # (B, N, 3, H, W) -> (B*N, 3, H, W). N=1 at inference.
         return m.unsqueeze(0)  # (1, 1, 3, 224, 224)
 
 
 # ---------------------------------------------------------------------------
 # Smoke test: synthetic input, no server.
-# Run via:  python -m uav_guidance.server_code_only.main_program.contextvae_inference
-# or:       python uav_guidance/server_code_only/main_program/contextvae_inference.py
+# Run via:  python uav_guidance/server_code_only/main_program/contextvae_inference.py
 #
-# The synthetic input drives the inferencer with a hand-crafted target moving
-# diagonally and two neighbors moving in parallel. We sanity-check that:
-#   - The returned array has shape (6, 2).
-#   - No NaNs / Infs.
-#   - Per-step displacement is plausible (< 5 m at 5 Hz cadence) for an
-#     agent that was moving at ~1 m per timestep.
-# This is the Step-1 verification from the implementation plan.
+# Drives the inferencer with a hand-crafted target moving diagonally and two
+# parallel neighbors, and checks: output shape (6, 2), no NaN/Inf, and
+# plausible per-step displacement (< 5 m at 5 Hz).
 # ---------------------------------------------------------------------------
 
 def _smoke_test() -> None:
     """Smoke-test the inferencer against a synthetic single-target scene."""
-    # Use a known map pickle from the val split. inD_01 was in the val split
-    # used for the M-ATTN headline run, so the trained model has seen this
-    # location (in the validation sense, not training).
+    # Use a real inD_01 val-split map/checkpoint so the crop geometry is valid.
     ckpt = os.path.join(_REPO_ROOT, "tmp", "levelx_full_map_v1", "ckpt-best")
     cfg = os.path.join(_REPO_ROOT, "configs", "levelx_train.py")
     map_pickle = os.path.join(_REPO_ROOT, "data", "levelx", "map", "inD_01.pkl")
@@ -933,9 +745,8 @@ def _smoke_test() -> None:
         config_path=cfg,
         map_pickle_path=map_pickle,
         device=None,  # auto-pick cuda if available
-        # Pin to the headline-checkpoint architecture in case the local
-        # config file is mid-experiment with map_model toggled to None.
-        # If you swap the checkpoint for a no-map one, override to None here.
+        # Pin the architecture to the M-ATTN checkpoint regardless of the
+        # local config's current map_model; override to None for a no-map ckpt.
         model_overrides={"map_model": "resnet18"},
     )
     print(
@@ -944,16 +755,10 @@ def _smoke_test() -> None:
     )
     print(f"[smoke] device         : {inf.device}")
 
-    # Synthetic target: 10 frames moving diagonally at ~1 m per timestep.
-    # The origin / scale are arbitrary; they just need to map onto a valid
-    # pixel coordinate via H. We pick a point that we know is near the
-    # center of the inD_01 recording (based on inspection of `data/levelx/`
-    # — the data.py `__getitem__` would have already crashed at training
-    # time if any sample's H @ hist[0] fell outside the raster, so we
-    # cheat and read one real target's first-obs-frame position from the
-    # val split file directly to guarantee the pivot is valid.
+    # Synthetic target: 10 frames moving diagonally at ~1 m per timestep. The
+    # pivot must map onto a valid raster pixel via H, so we read a real target's
+    # first-obs-frame position from the val split rather than invent coords.
     val_txt = os.path.join(_REPO_ROOT, "data", "levelx", "val", "inD_01.txt")
-    # Find one frame's coordinates to use as the pivot.
     pivot = None
     with open(val_txt, "r") as f:
         for line in f:
@@ -977,14 +782,14 @@ def _smoke_test() -> None:
         dtype=np.float64,
     )
 
-    # Two neighbors moving parallel to the target, offset laterally.
+    # Two neighbors parallel to the target, offset +/-3 m laterally.
     neighbors = {
-        101: target_hist + np.array([0.0, 3.0])[None, :],   # +3 m in y
-        102: target_hist + np.array([0.0, -3.0])[None, :],  # -3 m in y
+        101: target_hist + np.array([0.0, 3.0])[None, :],
+        102: target_hist + np.array([0.0, -3.0])[None, :],
     }
 
-    # Pass a synthetic heading (0 rad = +x) so the smoke test exercises the
-    # heading-aware code path and does NOT trip the one-shot fallback warning.
+    # Supply heading (0 rad = +x) to exercise the heading-aware path and avoid
+    # the one-shot fallback warning.
     out = inf.infer(target_hist, neighbors, heading_world=0.0)
     print(f"[smoke] output shape   : {out.shape}")
     print(f"[smoke] output[:3]     :\n{out[:3]}")
@@ -998,7 +803,7 @@ def _smoke_test() -> None:
         "predicting nonsense; check input scale and map registration."
     )
 
-    # Also exercise the new K-samples entry point used by replay_video.py.
+    # Also exercise the K-samples entry point used by replay_video.py.
     samples = inf.infer_samples(target_hist, neighbors, heading_world=0.0)
     K_expected = inf.k_samples
     print(f"[smoke] samples shape  : {samples.shape}")
@@ -1007,11 +812,8 @@ def _smoke_test() -> None:
         f"expected ({K_expected}, {PRED_HORIZON}, 2)"
     )
     assert np.isfinite(samples).all(), "samples contain NaN or Inf"
-    # Cross-check: mean of K samples truncated to PROTOCOL_FUTURE_STEPS
-    # must agree with `infer()`'s output (same seed-free deterministic path
-    # is not guaranteed across calls because the prior draws are stochastic,
-    # so we run both off the same forward batch by re-seeding torch here).
-    # Instead, just sanity-check that the K endpoints span more than a pixel.
+    # The prior draws are stochastic, so don't compare against infer()'s mean;
+    # just check the K endpoints spread out (modes didn't fully collapse).
     endpoints = samples[:, -1, :]  # (K, 2)
     spread = float(np.linalg.norm(endpoints.std(axis=0)))
     print(f"[smoke] endpoint spread: {spread:.4f} m (>=0 ok; ~0 means modes collapsed)")

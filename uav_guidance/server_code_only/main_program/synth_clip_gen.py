@@ -1,43 +1,36 @@
 """
-Synthetic moving-UAV clip generator (Week 3 Day 2-4 validation fixture).
+Synthetic moving-UAV clip generator (ego-motion validation fixture).
 
-Produces a short MP4 that looks like the inD_01 aerial scene shot from a
-MOVING drone, plus a sidecar JSON with ground-truth per-frame homographies
-and agent bounding boxes. Two consumers:
+Produces a short MP4 that looks like the inD_01 aerial scene shot from a MOVING
+drone, plus a sidecar JSON with ground-truth per-frame homographies and agent
+bounding boxes. Two consumers:
 
-  1. `tests/test_ego_motion_shim.py` — uses the GT homographies to score
-     `MovingCameraShim` recovery accuracy.
-  2. Week 3 Day 4-5 end-to-end replay — uses the rendered video (which
-     looks like real moving-UAV footage of inD vehicles) as the input
-     clip for the full server-side ContextVAE pipeline.
+  1. `tests/test_ego_motion_shim.py` — scores `MovingCameraShim` recovery
+     against the GT homographies.
+  2. The end-to-end replay — uses the rendered video as a moving-camera input
+     clip for the full ContextVAE pipeline.
 
 How the clip is built
 ---------------------
-- K0 = the un-padded inD_01 orthomap (cropped to remove the 202-px
-  preprocessing pad). This is the canonical "what the drone would see if
-  it were hovering exactly above the recording site at time t=0".
-- For each synth frame t in [0, N_FRAMES), apply a known homography
-  `H_K0 -> live[t]` (slow pan + 5 deg rotation + 10 % zoom over the clip)
-  to K0 via `cv2.warpPerspective`. That's the moving-drone illusion.
-- Overlay the inD agents at frame `t // FRAME_REPEAT`: pull their
-  world-metric (x, y) from `data/levelx/val/inD_01.txt`, transform
-  world -> K0-pixel via the static `PixelMetricShim`, then K0-pixel ->
-  live-pixel via the SAME `H_K0 -> live[t]`. Draw a rectangle + agent id.
-  Only `TARGET`-tagged agents are drawn (mirrors the training-time
-  `inclusive_groups=["TARGET"]` filter in configs/levelx_train.py).
-- Save MP4 via imageio (ffmpeg backend) + a JSON sidecar with one record
-  per frame containing the GT `H_live -> K0` (inverse of the warp we
-  applied) and the rendered agent bboxes in live-pixel `[l, t, w, h]`
-  form (so a downstream tester could compare them against
-  `MovingCameraShim`-reprojected positions).
+- K0 = the un-padded inD_01 orthomap (the 202-px preprocessing pad removed) —
+  what the drone would see hovering over the site at t=0.
+- For each frame t, warp K0 by a known H_K0 -> live[t] (slow pan + 5 deg
+  rotation + 10% zoom over the clip) via cv2.warpPerspective: the moving-drone
+  illusion.
+- Overlay the inD agents at frame t // FRAME_REPEAT: read world (x, y) from
+  `data/levelx/val/inD_01.txt`, map world -> K0-pixel via `PixelMetricShim`,
+  then K0-pixel -> live-pixel via the same H_K0 -> live[t]. Only TARGET-tagged
+  agents are drawn, mirroring the `inclusive_groups=["TARGET"]` training filter.
+- Write the MP4 plus a JSON sidecar with the GT H_live -> K0 (inverse of the
+  applied warp) and each rendered agent's live-pixel [l, t, w, h], so a tester
+  can compare against MovingCameraShim-reprojected positions.
 
 Run
 ---
     python uav_guidance/server_code_only/main_program/synth_clip_gen.py
     # writes tmp/synth_uav_clip.mp4 + tmp/synth_uav_clip_gt.json
 
-No CLI args; tweak the constants below if you need a different motion
-profile or length.
+No CLI args; tweak the constants below for a different motion profile or length.
 """
 
 import json
@@ -88,19 +81,15 @@ ID_FONT_THICKNESS = 1
 def load_K0_bgr(map_pickle_path: Path) -> np.ndarray:
     """Decode the orthomap pickle into a BGR uint8 image at K0 (un-padded) scale.
 
-    Pickle payload is `(semantic_map, H)` where semantic_map is (3, H_pad,
-    W_pad) float32 in [-1, 1]. The static H in the pickle was fitted such
-    that `H @ [x, y, 1] = [row_padded, col_padded, 1]` — see
-    pixel_metric_shim.PixelMetricShim for the contract. K0 here is the
-    image WITHOUT the EXT_PAD=202 border so that K0-pixel == un-padded
-    image-pixel (the frame the four conversion methods speak natively)."""
+    Pickle payload is `(semantic_map, H)` with semantic_map (3, H_pad, W_pad)
+    float32 in [-1, 1] and H mapping world -> padded (row, col). K0 is the
+    image with the EXT_PAD=202 border removed, so K0-pixel == un-padded
+    image-pixel (the frame the shim conversion methods speak natively)."""
     with open(map_pickle_path, "rb") as f:
         sm, _H = pickle.load(f)
     # (3, H, W) float32 in [-1, 1]  ->  (H, W, 3) uint8
     img_padded = ((sm.transpose(1, 2, 0) + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
-    # The pickle is RGB (process_levelx.ipynb:425 uses Image.open(...).convert("RGB")
-    # before normalizing to [-1, 1]). cv2.VideoWriter and the downstream
-    # MovingCameraShim ORB matcher both expect BGR, so swap channels here.
+    # The pickle stores RGB; cv2.VideoWriter and the ORB matcher expect BGR.
     img_padded = cv2.cvtColor(img_padded, cv2.COLOR_RGB2BGR)
     img_K0 = img_padded[EXT_PAD:-EXT_PAD, EXT_PAD:-EXT_PAD]
     return np.ascontiguousarray(img_K0)
@@ -177,7 +166,7 @@ def main() -> int:
     H_traj = make_h_trajectory(W_K0, H_K0, N_FRAMES)
 
     print(f"[synth] writing {N_FRAMES} frames at {FPS} fps -> {OUT_MP4}")
-    # cv2.VideoWriter with mp4v fourcc; ffmpeg backend (no imageio_ffmpeg dep).
+    # cv2.VideoWriter with mp4v fourcc (no imageio_ffmpeg dependency).
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(OUT_MP4), fourcc, float(FPS), (W_K0, H_K0))
     if not writer.isOpened():
@@ -202,14 +191,13 @@ def main() -> int:
             rendered_agents: List[dict] = []
 
             for aid, x_m, y_m in agents_this_frame:
-                # world -> K0 (PixelMetricShim already speaks un-padded
-                # K0-pixel space) -> live via the warp we just applied.
+                # world -> K0 pixel (via the shim) -> live pixel (via the warp).
                 u_K0, v_K0 = shim.metric_to_pixel(x_m, y_m)
                 uv_live = project_homog(
                     H_K0_to_live, np.array([[u_K0, v_K0]])
                 )[0]
                 u_live, v_live = float(uv_live[0]), float(uv_live[1])
-                # Skip agents projected off-frame.
+                # Skip agents that project off-frame.
                 if not (0 <= u_live < W_K0 and 0 <= v_live < H_K0):
                     continue
                 x0 = int(round(u_live - BBOX_HALF_W))

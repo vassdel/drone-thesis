@@ -1,8 +1,8 @@
-"""Render per-agent inference visualizations: orthomap + observation history +
-ground-truth future + K predicted samples, in agent-meter coordinates.
+"""Render per-agent inference figures: orthomap patch, observation history,
+ground-truth future, and K predicted samples, all in agent-centered meters.
 
-Mirrors `contextvae/main.py`'s config-loading, dataset construction, and
-checkpoint-loading. Iterates the first --num_batches batches of the eval set,
+Mirrors `contextvae/main.py`'s config loading, dataset construction, and
+checkpoint loading. Iterates the first --num_batches batches of the eval set,
 runs `model(x, neighbor, *m, n_predictions=K)`, and writes one PNG per agent.
 
 Usage (run from repo root with the project conda env active):
@@ -77,7 +77,10 @@ def resolve_ckpt_path(ckpt_arg):
 
 def get_recording_H(test_dataset, map_name):
     """Re-derive the per-recording homography H from the dataset's map dict.
-    Mirrors data.py:347-356 to handle the four storage cases."""
+
+    Mirrors the map-loading logic in data.py, covering the four ways a map entry
+    may be stored: tuple, path string, in-memory npz buffer, or absent.
+    """
     if not test_dataset.use_map:
         return None
     entry = test_dataset.map.get(map_name)
@@ -119,7 +122,8 @@ def render_one(hist, future, preds, map_patch, m_per_px, seq_len, title, out_pat
     fig, ax = plt.subplots(1, 1, figsize=(7, 7))
 
     if map_patch is not None and m_per_px is not None:
-        # 224x224 patch; agent sits at row 112, col 56 (asymmetric crop).
+        # The 224x224 patch is cropped asymmetrically: the agent sits at
+        # (row 112, col 56), so most of the field of view lies ahead of it.
         x_min = -56 * m_per_px
         x_max = 168 * m_per_px
         y_min = -112 * m_per_px
@@ -208,9 +212,9 @@ def main():
 
     os.makedirs(args.output, exist_ok=True)
 
-    # Materialize index lists deterministically (shuffle=False) so we can pair
-    # each batch with the global dataset indices, hence with each agent's
-    # recording id (and per-recording homography).
+    # Draw batch index lists up front (shuffle=False keeps them deterministic)
+    # so each batch can be paired with its global dataset indices, and hence
+    # with each agent's recording id and per-recording homography.
     sampler_iter = iter(test_dataset.batch_sampler)
     index_lists = []
     for _ in range(args.num_batches):

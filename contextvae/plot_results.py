@@ -1,19 +1,16 @@
-"""Render thesis Chapter 6 result figures from the locked numbers.
+"""Render the result figures from the final evaluation numbers.
 
-This script bakes in the K-sweep table from ``tmp/sweep_k.log`` (run on
-2026-05-18) and the LSTM headline numbers from ``tmp/levelx_lstm.eval.log``
-(run on 2026-05-27) so the figures can be regenerated deterministically
-without re-running eval.
-
-Run inside ``new_xupei_env``::
+The K-sweep table and LSTM headline numbers are baked in as constants below
+(sourced from the recorded eval logs) so the figures regenerate
+deterministically without re-running evaluation.
 
     python -m contextvae.plot_results --out-dir tmp/figs
 
 Outputs (PNG, 200 dpi):
 
-- ``k_sweep_ade.png`` / ``k_sweep_fde.png`` (A2)
-- ``headline_ade_fde.png``                  (A3)
-- ``mattn_relative_gain.png``               (A4)
+- ``k_sweep_ade.png`` / ``k_sweep_fde.png``
+- ``headline_ade_fde.png``
+- ``mattn_relative_gain.png``
 """
 
 import argparse

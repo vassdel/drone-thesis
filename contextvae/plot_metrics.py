@@ -1,15 +1,12 @@
 """Render per-epoch metric curves from a ContextVAE training run.
 
-Reads the TensorBoard event files written by `contextvae.main` and emits a
-single 2x2 PNG. The four panels are:
+Reads the TensorBoard event files written by ``contextvae.main`` and emits a
+single 2x2 PNG with these panels:
 
-    top-left   train/loss (log scale)
-    top-right  train/kl  (KL active <=> non-zero => no posterior collapse)
-    bottom-left   eval_ADE (min-of-K solid line; deterministic dotted)
-    bottom-right  eval_FDE (min-of-K solid line; deterministic dotted)
-
-Run inside the project conda env (`new_xupei_env`), e.g.
-`conda run --no-capture-output -n new_xupei_env python -m contextvae.plot_metrics ...`.
+    top-left      train/loss (log scale)
+    top-right     train/kl  (non-zero KL indicates no posterior collapse)
+    bottom-left   eval_ADE  (min-of-K solid line; deterministic dotted)
+    bottom-right  eval_FDE  (min-of-K solid line; deterministic dotted)
 
 Usage examples
 --------------
@@ -33,15 +30,15 @@ Usage examples
 CLI options
 -----------
 run_dir              (positional, required) Directory containing TB event
-                     files. The root event file supplies `train/*` tags;
-                     each subdir (e.g. `eval_ADE_min/`) is read separately
-                     and labelled by its name (the writers in main.py log
-                     under the bare tag `eval`, so the subdir name is the
-                     only disambiguator).
+                     files. The root event file supplies the ``train/*``
+                     tags; each subdir (e.g. ``eval_ADE_min/``) is read
+                     separately and labelled by its name. main.py logs eval
+                     scalars under a bare ``eval`` tag, so the subdir name is
+                     the only disambiguator.
 --baseline DIR       (optional) A second run dir. Its final-epoch
-                     `eval_ADE_min` and `eval_FDE_min` values are drawn as
-                     dashed horizontal lines on the ADE/FDE panels for
-                     quick "did we beat the baseline" comparison.
+                     ``eval_ADE_min`` and ``eval_FDE_min`` values are drawn
+                     as dashed horizontal reference lines on the ADE/FDE
+                     panels.
 --out PATH           (optional) Output PNG path.
                      Default: <run_dir>/metrics.png.
 --title STR          (optional) Figure suptitle.

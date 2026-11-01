@@ -9,9 +9,9 @@ from contextvae.model import ContextVAE
 from contextvae.data import Dataloader
 from contextvae.utils import ADE_FDE, seed, clustering, get_rng_state, set_rng_state
 
-# DataLoader prefetch worker count (Pool 2: torch.utils.data.DataLoader workers,
-# fork-based on Linux, copy-on-write so cheaper than the loader pool).
-# Active only when config.preload_data is True.
+# Prefetch workers for the torch DataLoader (used only when config.preload_data
+# is True). Fork-based and copy-on-write on Linux, so cheaper than the dataset's
+# own loading pool.
 DATALOADER_NUM_WORKERS = 3
 
 import argparse
@@ -58,11 +58,7 @@ if __name__ == "__main__":
         device_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
         torch.set_num_threads(min(torch.get_num_threads()//device_count, 20))
 
-    ###############################################################################
-    #####                                                                    ######
-    ##### prepare datasets                                                   ######
-    #####                                                                    ######
-    ###############################################################################
+    # ---- Prepare datasets ----
     preload_kwargs = dict(
         num_workers=DATALOADER_NUM_WORKERS, pin_memory=False, prefetch_factor=2, persistent_workers=True,
     ) if config.preload_data else dict()
@@ -102,11 +98,7 @@ if __name__ == "__main__":
             )
         batches = train_dataset.batches_per_epoch
 
-    ###############################################################################
-    #####                                                                    ######
-    ##### load model                                                         ######
-    #####                                                                    ######
-    ###############################################################################
+    # ---- Build model and optimizer, restoring from checkpoint if present ----
     model_cls = getattr(config, "model_cls", ContextVAE)
     model = model_cls(**config.model)
     model.to(device)
@@ -153,7 +145,7 @@ if __name__ == "__main__":
         dist.init_process_group(backend, rank=settings.rank, world_size=settings.workers)
         device_ids = None if settings.device is None else [settings.device]
         if model.use_map:
-            # resnet uses batch norm
+            # The ResNet map backbone uses BatchNorm; sync its stats across ranks.
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = DDP(model, device_ids=device_ids)
         model.state_dict = model.module.state_dict
@@ -173,11 +165,7 @@ if __name__ == "__main__":
         optimizer.zero_grad()
 
     for epoch in range(start_epoch+1, end_epoch+1):
-        ###############################################################################
-        #####                                                                    ######
-        ##### train                                                              ######
-        #####                                                                    ######
-        ###############################################################################
+        # ---- Train one epoch ----
         losses = None
         if train_data is not None and epoch <= config.epochs:
             print("Epoch {}/{}".format(epoch, config.epochs))
@@ -213,11 +201,7 @@ if __name__ == "__main__":
 
         gc.collect()
         torch.cuda.empty_cache()
-        ###############################################################################
-        #####                                                                    ######
-        ##### test                                                               ######
-        #####                                                                    ######
-        ###############################################################################
+        # ---- Evaluate: minADE/FDE over K samples, plus a deterministic pass ----
         ade, fde, ade_d, fde_d = 10000, 10000, 10000, 10000
         perform_test = (train_data is None or config.test_since <= epoch) and test_data is not None
         if perform_test:
@@ -227,9 +211,9 @@ if __name__ == "__main__":
             tic = time.time()
             model.eval()
 
-            ADE, FDE = [], []
-            ADE_d, FDE_d = [], []
-            m = None # stub for map tensor data
+            ADE, FDE = [], []     # min-over-K (stochastic) errors
+            ADE_d, FDE_d = [], [] # deterministic (posterior-mean) errors
+            m = None # placeholder for the optional map tensor
             set_rng_state(init_rng_state, device)
             batch = 0
             with torch.no_grad():
@@ -244,6 +228,8 @@ if __name__ == "__main__":
 
                     tic = time.time()
                     if config.clustering:
+                        # Draw many samples, then k-means them down to pred_samples
+                        # representative modes before scoring minADE_k/minFDE_k.
                         if model.use_map:
                             y_ = model(x, neighbor, *m, n_predictions=config.clustering)
                         else:
@@ -303,11 +289,7 @@ if __name__ == "__main__":
                 fde_d = fde_d.item()
                 sys.stdout.write("\r\033[K ADE: {:.4f}/{:.4f}; FDE: {:.4f}/{:.4f} -- time: {}s".format(ade, ade_d, fde, fde_d, int(time.time()-tic)))
             print()
-        ###############################################################################
-        #####                                                                    ######
-        ##### log                                                                ######
-        #####                                                                    ######
-        ###############################################################################
+        # ---- Log metrics and save checkpoints (last + best) ----
         if is_chief and losses is not None and settings.ckpt:
             if logger is not None:
                 for k, v in losses.items():

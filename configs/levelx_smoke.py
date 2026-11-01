@@ -1,10 +1,10 @@
-# Disposable 1-epoch smoke-test config. Inherits everything from levelx_train,
-# overrides only the duration and eval-gate so a single recording finishes in
-# ~1-2 min on A40 and a checkpoint is produced for the eval-determinism step.
+# levelX 1-epoch smoke test. Inherits levelx_train and overrides only the
+# duration and eval gate so a single recording finishes quickly and produces a
+# checkpoint for the eval-determinism check.
 from .levelx_train import *
 
 epochs = 1
-test_since = 0  # run eval at epoch 0 so we get a checkpoint with eval metrics
+test_since = 0  # evaluate at epoch 0 so the checkpoint carries eval metrics
 
-# Shallow-copy the dict so we don't mutate the parent module's dict object.
+# Shallow-copy so we don't mutate the parent module's dict.
 train_dataloader = {**train_dataloader, "batches_per_epoch": 20}

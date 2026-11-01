@@ -1,26 +1,24 @@
-"""
-eval_perseq.py — per-sequence cross-domain eval with micro + macro aggregates.
+"""Per-sequence cross-domain evaluation with micro and macro aggregates.
 
-Motivation. `contextvae/main.py` pools every test trajectory into one loader and
-reports a single window-weighted (micro) ADE/FDE. On VisDrone that lets a few
-long sequences dominate (e.g. one seq = 65 % of the 5 s windows), so the pooled
-number reads as "one intersection," not a cross-domain average. This script runs
-the SAME eval math as main.py but PER SEQUENCE, then reports:
+`contextvae/main.py` pools every test trajectory into one loader and reports a
+single window-weighted (micro) ADE/FDE. On a heterogeneous set like VisDrone a
+few long sequences dominate that pooled number, so it reflects one busy scene
+rather than a cross-domain average. This script runs the same eval math as
+main.py but per sequence, then reports:
 
   - a per-sequence table,
-  - MICRO average  (window-weighted; reproduces main.py's pooled number),
-  - MACRO average  (mean over sequences -> the robust "typical scene" headline)
-                   with std / min / max across scenes,
-  - a constant-velocity (CV) baseline per sequence (scale-robust sanity).
+  - MICRO average (window-weighted; reproduces main.py's pooled number),
+  - MACRO average (mean over sequences -> the robust "typical scene" headline)
+    with std / min / max across scenes,
+  - a constant-velocity (CV) baseline per sequence (scale-robust sanity check).
 
-The clustered min-of-K path is copied verbatim from main.py:246-262 (no-map
-branch) so the numbers are directly comparable. RNG is reset to the same initial
-state main.py uses (seed -> get_rng_state -> set_rng_state before each seq), so
-the DETERMINISTIC micro-average matches main.py exactly and minADE matches
-closely (batch composition differs across the seq boundary, which slightly
-perturbs the stochastic sampling order — expected).
+The clustered min-of-K path mirrors main.py's no-map branch so the numbers are
+directly comparable. RNG is reset to main.py's initial state before each
+sequence, so the deterministic micro-average matches main.py exactly; minADE
+matches closely (batch composition differs at the sequence boundary, which
+slightly perturbs the stochastic sampling order).
 
-Usage (identical args to main.py eval; no --map_dir = no-map path):
+Usage (same args as main.py eval; omitting --map_dir selects the no-map path):
     PY=/home/vdelis/anaconda3/envs/new_xupei_env/bin/python
     $PY -m contextvae.eval_perseq --test data/visdrone_levelx/val \
         --config configs/visdrone_eval_2s.py --ckpt tmp/nomap-s-attn/ckpt-best
@@ -59,7 +57,11 @@ def build_model(config, ckpt_path, device):
 
 
 def predict_clustered(model, x, neighbor, config):
-    """min-of-K with clustering — verbatim from main.py:246-262 (no-map branch)."""
+    """min-of-K sampling with k-means clustering; mirrors main.py's no-map branch.
+
+    Returns an (n_samples, L, N, 2) tensor of candidate future trajectories.
+    With clustering on, oversamples then clusters down to pred_samples modes.
+    """
     if config.clustering:
         if getattr(model, "use_map", False):
             y_ = model(x, neighbor, n_predictions=config.clustering)
@@ -74,22 +76,26 @@ def predict_clustered(model, x, neighbor, config):
         y_ = torch.as_tensor(np.stack(cand, 2), device=y_.device, dtype=y_.dtype)
     else:
         y_ = model(x, neighbor, n_predictions=config.pred_samples)
-    return y_  # n_samples x L x N x 2
+    return y_
 
 
 def cv_error(x, y):
-    """Constant-velocity ADE/FDE per window. x:(L,N,6) y:(H,N,2). Returns (ade(N,), fde(N,))."""
+    """Constant-velocity ADE/FDE per window.
+
+    Extrapolates the last observed position/velocity forward H steps.
+    x: (L, N, 6), y: (H, N, 2). Returns per-agent (ade (N,), fde (N,)).
+    """
     last_pos = x[-1, :, :2]
     last_vel = x[-1, :, 2:4]
     H = y.shape[0]
     steps = torch.arange(1, H + 1, device=y.device, dtype=y.dtype).view(H, 1, 1)
     cv = last_pos.unsqueeze(0) + steps * last_vel.unsqueeze(0)
-    err = (cv - y).norm(dim=-1)  # (H, N)
+    err = (cv - y).norm(dim=-1)
     return err.mean(0), err[-1]
 
 
 def eval_one_file(path, config, model, device, init_rng):
-    """Run the full eval on a single .txt; return per-window arrays, or None if empty."""
+    """Evaluate a single sequence .txt; return per-window error arrays, or None if empty."""
     try:
         ds = Dataloader(
             [path],
@@ -98,14 +104,16 @@ def eval_one_file(path, config, model, device, init_rng):
             map_dir=None, shuffle=False,
         )
     except Exception:
-        return None  # 0-trajectory sequence (e.g. pedestrian-only) -> loader has no data
+        # Sequence with no vehicle targets (e.g. pedestrian-only): loader has no data.
+        return None
     if len(ds.data) == 0:
         return None
 
     loader = torch.utils.data.DataLoader(
         ds, collate_fn=ds.collate_fn, batch_sampler=ds.batch_sampler)
 
-    set_rng_state(init_rng, device)  # reproducible per-seq stochastic sampling
+    # Reset RNG so per-sequence stochastic sampling is reproducible and comparable.
+    set_rng_state(init_rng, device)
     ade_min, fde_min, ade_det, fde_det, ade_cv, fde_cv = [], [], [], [], [], []
     with torch.no_grad():
         for item in loader:
@@ -168,7 +176,8 @@ def main():
         print("\nNo sequences with vehicle targets.")
         return 0
 
-    # MICRO = window-weighted (== main.py pooled). MACRO = mean over sequences.
+    # MICRO: pool all windows and average (equals main.py's window-weighted number).
+    # MACRO: average the per-sequence means, giving every scene equal weight.
     micro = {k: float(np.concatenate(pooled[k]).mean()) for k in pooled}
     macro = {k: np.array([m[k] for _, _, m in per_seq]) for k in pooled}
     n_seq = len(per_seq)

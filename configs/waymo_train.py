@@ -1,15 +1,16 @@
-OB_HORIZON = 6
-PRED_HORIZON = 15
-OB_RADIUS = 30
-MAP_SIZE = 224
+# Waymo ContextVAE training (distributed across 8 ranks).
+OB_HORIZON = 6        # observation window in frames
+PRED_HORIZON = 15     # prediction horizon in frames
+OB_RADIUS = 30        # neighbor-selection radius in meters
+MAP_SIZE = 224        # HD-map raster patch side in pixels
 
 
 lr = 3e-4
 epochs = 400
-test_since = 120
+test_since = 120      # start evaluating from epoch 120
 preload_data = False
 pred_samples = 5
-clustering = 0
+clustering = 0        # eval-time clustering is enabled in waymo_eval.py
 
 train_dataloader = dict(
     ob_horizon=OB_HORIZON,
@@ -26,9 +27,9 @@ test_dataloader = dict(
     pred_horizon=PRED_HORIZON,
     ob_radius=OB_RADIUS,
     inclusive_groups=["EGO", "VEHICLE"],
-    # let each sub-trajectory has at most 7 frame overlapped
-    # this setting is to reduce the data size when testing during training
-    traj_max_overlap=7, 
+    # Cap overlap between consecutive sub-trajectories at 7 frames to shrink the
+    # test set evaluated during training.
+    traj_max_overlap=7,
     batch_size=256
 )
 

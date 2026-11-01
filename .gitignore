@@ -32,3 +32,13 @@ runs/
 *.ckpt
 *.pt
 tmp/
+
+# Scratch / stray outputs
+nomap-s-attn.txt
+*.log
+*.out
+*.mp4
+
+# Compiled model artifacts (e.g. OpenVINO IR)
+*.bin
+*.xml

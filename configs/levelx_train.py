@@ -1,18 +1,19 @@
-# 6-D state's vx, vy are meters per timestep (0.2 s at 5 Hz), NOT m/s.
-# Convert (multiply by 5) before any cross-comparison with the Ntousis LSTM.
-MIN_OB_HORIZON = 10
-OB_HORIZON = 10
-PRED_HORIZON = 25
-OB_RADIUS = 30
-MAP_SIZE = 224
+# levelX (inD+uniD+rounD) ContextVAE training — primary aerial-orthomap config.
+# Horizons are in frames at 5 Hz (one frame = 0.2 s). The 6-D state's vx, vy are
+# meters per timestep, not m/s (multiply by 5 to get m/s).
+MIN_OB_HORIZON = 10   # minimum observed frames to form a window (2 s)
+OB_HORIZON = 10       # observation window: 10 frames = 2 s
+PRED_HORIZON = 25     # prediction horizon: 25 frames = 5 s
+OB_RADIUS = 30        # neighbor-selection radius in meters
+MAP_SIZE = 224        # orthomap patch side in pixels (~30 m coverage post-rotation)
 
 
 lr = 3e-4
 epochs = 60
-test_since = 5
+test_since = 5        # start evaluating from epoch 5
 preload_data = False
 pred_samples = 5
-clustering = 0
+clustering = 0        # eval-time clustering is enabled in levelx_eval.py
 
 train_dataloader = dict(
     min_ob_horizon=MIN_OB_HORIZON,
@@ -20,12 +21,12 @@ train_dataloader = dict(
     map_size=MAP_SIZE,
     pred_horizon=PRED_HORIZON,
     ob_radius=OB_RADIUS,
-    inclusive_groups=["TARGET"],
+    inclusive_groups=["TARGET"],  # only vehicles tagged TARGET are predicted; VRUs stay as context
     batch_size=256,
     batches_per_epoch=1000, # ~25% of the ~1M-trajectory train split per epoch
-    # CHANGE (2A): training-time map augmentation (color jitter ±0.2,
-    # rotation ±5°, scale ±10%). Self-gates on use_map=True (--map_dir present),
-    # so it's a no-op for the no-map S-ATTN-only baseline.
+    # Training-time map augmentation (color jitter, small rotation/scale).
+    # Only active when a map is used (--map_dir present), so it is a no-op for
+    # the no-map S-ATTN-only baseline.
     map_augment=True,
 )
 test_dataloader = dict(
@@ -42,8 +43,8 @@ model = dict(
     horizon = PRED_HORIZON,
     ob_radius = OB_RADIUS,
     hidden_dim = 512,
-    # Aerial-orthomap variant: ResNet-18 backbone, ImageNet-pretrained weights
-    # (loaded via 1A in contextvae/model.py), map-input dropout p=0.15 (1B),
-    # and training-time map augmentation (2A, gated by `map_augment` above).
-    map_model = "resnet18" # "resnet18" OR None 
+    # Aerial-orthomap M-ATTN variant: ResNet-18 backbone with ImageNet-pretrained
+    # weights and map-input dropout (see contextvae/model.py). Set to None for the
+    # no-map S-ATTN-only baseline.
+    map_model = "resnet18"
 )

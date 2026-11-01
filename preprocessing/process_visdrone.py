@@ -1,49 +1,43 @@
 #!/usr/bin/env python3
-"""
-process_visdrone.py — VisDrone2019-MOT  ->  ContextVAE on-disk .txt format.
+"""VisDrone2019-MOT -> ContextVAE on-disk .txt format (cross-domain evaluation).
 
-Cross-domain evaluation preprocessor (thesis Week 4, Experiment 3). Converts an
-official VisDrone-MOT split into the same `<name>.txt` rows that
-`contextvae/data.py` consumes, so the EXISTING `contextvae/main.py` eval loop
-(deterministic ADE/FDE + minADE_k/minFDE_k) can be run on VisDrone with no
-changes — giving numbers computed identically to the inD/uniD/rounD val numbers.
+Converts a VisDrone-MOT split into the same per-sequence rows that
+contextvae/data.py consumes, so the existing contextvae/main.py eval loop
+(deterministic ADE/FDE + minADE_k/minFDE_k) runs on VisDrone unchanged and
+produces numbers comparable to the inD/uniD/rounD validation metrics.
 
-Conversion is SCALE-ONLY (locked decision): a per-sequence scalar metres-per-pixel
-calibrated from the known length of a typical sedan (~4.5 m), exactly as the
-qualitative replay did. There is NO ego-motion compensation here, so on
-moving-camera clips the metric is partly contaminated by drone motion. Report
-every resulting number with the documented ±~30 % scale band — never as an
-apples-to-apples figure against inD/uniD. (See `pixel_metric_shim.py:241-246`
-and docs/w4_ablations_results.md §4.2.)
+Conversion is scale-only: a per-sequence meters-per-pixel scalar calibrated from
+the known length of a typical sedan (~4.5 m). There is no ego-motion
+compensation, so on moving-camera clips the metric is partly contaminated by
+drone motion; report results with an approximate +/-30% scale band rather than
+as apples-to-apples figures against inD/uniD.
 
 On-disk output (one file per sequence, under <out>/):
     <seq>.txt   rows:  fid aid x y heading group
                        - fid    : 5-Hz frame index, renumbered 0,1,2,...
                        - aid    : VisDrone target_id
-                       - x, y   : metric world coords (metres), +y UP
+                       - x, y   : metric world coords (meters), +y UP
                        - heading: radians, finite-diff atan2 of world motion
                        - group  : "VEHICLE/TARGET" (cars/vans/trucks/buses) or
                                   "VRU" (pedestrians/people/bikes/tricycles/motor)
 
-Velocities/accelerations are NOT written: data.py's extend() derives them as
-per-step position deltas (vx = x[t+1]-x[t]). We only have to guarantee a uniform
-5-Hz frame grid in metric units, which this script produces.
+Velocities/accelerations are not written: data.py's extend() derives them as
+per-step position deltas (vx = x[t+1]-x[t]). This script only has to guarantee a
+uniform 5-Hz frame grid in metric units.
 
-Why scale-only needs no images for the geometry: bbox centres + a scalar m/px
-are enough. We DO open one frame per sequence purely to read (W, H) for the
-origin (frame centre). Origin choice is cosmetic — ADE/FDE are
-translation/reflection invariant and the loader ego-normalises each window — so
-the only thing that matters numerically is the m/px scale and the +y flip.
+Geometry needs only bbox centers and the m/px scalar; one frame per sequence is
+opened purely to read (W, H) for the origin (frame center). The origin choice is
+cosmetic -- ADE/FDE are translation/reflection invariant and the loader
+ego-normalizes each window -- so only the m/px scale and the +y flip matter.
 
 Usage
 -----
-    PY=/home/vdelis/anaconda3/envs/new_xupei_env/bin/python
-    $PY preprocessing/process_visdrone.py \
+    python preprocessing/process_visdrone.py \
         --root full-visdrone \
         --out  data/visdrone_levelx/val \
         --fps  30 --target-hz 5
 
-The VisDrone-MOT layout expected under --root:
+VisDrone-MOT layout expected under --root:
     <root>/annotations/<seq>.txt
     <root>/sequences/<seq>/<frame>.jpg
 """
@@ -60,12 +54,12 @@ from collections import defaultdict
 #   7 tricycle 8 awning-tricycle  9 bus  10 motor  11 others
 # Vehicles match the inD/uniD TARGET classes the model was trained on
 # (car/van/truck/bus). Everything else trackable is kept as VRU context so the
-# S-ATTN neighbour set mirrors training (where VRUs are neighbours, never egos).
+# S-ATTN neighbor set mirrors training (where VRUs are neighbors, never targets).
 VEHICLE_CLASSES = frozenset({4, 5, 6, 9})
 VRU_CLASSES = frozenset({1, 2, 3, 7, 8, 10})
 # 0 (ignored regions) and 11 (others) are dropped entirely.
 
-ASSUMED_CAR_LEN_M = 4.5  # typical sedan length; same heuristic as the replay run.
+ASSUMED_CAR_LEN_M = 4.5  # typical sedan length, for the m/px calibration
 
 
 def parse_args():
@@ -152,11 +146,10 @@ def _median_first_long_axis(rows, cat):
 def calibrate_m_per_px(rows, assumed_car_len, default_mpp):
     """
     m/px from the median long-axis of a known-length vehicle class at first
-    appearance. Mirrors the replay calibration that produced 0.04018 on
-    uav0000305_00000_v. Fallback chain for car-less scenes (common across the
-    larger MOT splits): cars (class 4, ~4.5 m) -> vans (class 5, ~4.8 m) ->
-    hard default. Trucks/buses are NOT used — their lengths are too variable to
-    calibrate from. Returns (m_per_px, n_tracks_used, source_label).
+    appearance. Fallback chain for car-less scenes (common across the larger MOT
+    splits): cars (class 4, ~4.5 m) -> vans (class 5, ~4.8 m) -> hard default.
+    Trucks/buses are not used -- their lengths are too variable to calibrate
+    from. Returns (m_per_px, n_tracks_used, source_label).
     """
     for cat, label, length in [(4, "car", assumed_car_len), (5, "van", 4.8)]:
         median, n = _median_first_long_axis(rows, cat)
@@ -239,7 +232,7 @@ def process_sequence(seq, anno_path, seq_dir, args):
             continue
         cu = r["left"] + r["w"] / 2.0
         cv = r["top"] + r["h"] / 2.0
-        # Scale-only pixel -> metric (ScaleOnlyShim convention: +y up, so flip v).
+        # Scale-only pixel -> metric; world is +y up, so flip the image v axis.
         x_m = (cu - u0) * m_per_px
         y_m = -(cv - v0) * m_per_px
         per_agent[r["tid"]].append((fid_renumber[r["frame"]], x_m, y_m, g))

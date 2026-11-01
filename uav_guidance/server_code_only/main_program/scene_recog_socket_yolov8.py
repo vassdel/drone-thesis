@@ -28,24 +28,16 @@ def int_8_lst_to_int(lst):
         return num
 
 # ---------------------------------------------------------------------------
-# ContextVAE inference imports.
-# Week 3 Day 1-2 of the thesis schedule replaces the per-target LSTM
-# (`tr_pred_lstm`) trajectory predictor that used to live here with a
-# ContextVAE-based one. The two-module split below keeps the swap clean:
-#   - ContextVAEInferencer wraps the trained model + map raster and runs
-#     one inference per frame on a single target (batch size N=1). It
-#     consumes METRIC world coords and emits future positions in the
-#     same frame.
-#   - PixelMetricShim bridges the server's image pixels (what DeepSORT
-#     produces and the wire protocol returns to the UAV) and the
-#     metric coordinates ContextVAE expects. Day 1-2 backs the shim with
-#     the per-recording homography baked into the map pickle; Day 2-4
-#     swaps that for ORB/AKAZE+RANSAC ego-motion compensation under the
-#     same call signature.
-# Both modules sit alongside this file in `uav_guidance/server_code_only/
-# main_program/` and re-export their respective constants (OB_HORIZON,
-# PROTOCOL_FUTURE_STEPS, EXT_PAD) so the server doesn't need to know the
-# internals.
+# ContextVAE trajectory predictor (replaces Ntousis' per-target LSTM).
+# The swap is split across two modules:
+#   - ContextVAEInferencer wraps the trained model + map raster and runs one
+#     inference per frame for a single target (N=1), in metric world coords.
+#   - PixelMetricShim converts between the server's image pixels (what DeepSORT
+#     produces and the wire protocol returns) and those metric coords, using
+#     the per-recording homography baked into the map pickle. When ego-motion
+#     compensation is enabled, MovingCameraShim replaces it under the same API.
+# Both modules re-export OB_HORIZON / PROTOCOL_FUTURE_STEPS / EXT_PAD so the
+# server does not need to know their internals.
 # ---------------------------------------------------------------------------
 from contextvae_inference import (
     ContextVAEInferencer,
@@ -55,31 +47,21 @@ from contextvae_inference import (
 from pixel_metric_shim import PixelMetricShim
 
 # ---------------------------------------------------------------------------
-# Week 3 Day 2-4: opt-in ego-motion compensation for moving-UAV footage.
-# When EGO_MOTION_ENABLED is True, `pixel_shim` is built as a
-# `MovingCameraShim` (same four-method API as PixelMetricShim plus a new
-# `update_frame(frame_bgr, mask_bboxes_ltwh)` lifecycle call invoked once
-# per frame after YOLO detection). When False, behavior is bit-for-bit
-# identical to the Day 1-2 stationary-drone code path. See
-# uav_guidance/server_code_only/main_program/ego_motion_shim.py and the
-# accompanying tests/test_ego_motion_shim.py validation harness.
+# Opt-in ego-motion compensation for moving-UAV footage. When enabled,
+# `pixel_shim` becomes a MovingCameraShim (same API as PixelMetricShim plus an
+# `update_frame(frame_bgr, mask_bboxes_ltwh)` call made once per frame after
+# detection). When disabled, the stationary-drone path is unchanged.
 # ---------------------------------------------------------------------------
 EGO_MOTION_ENABLED = False
 if EGO_MOTION_ENABLED:
     from ego_motion_shim import MovingCameraShim
 
 # ---------------------------------------------------------------------------
-# Server-side ContextVAE configuration.
-# These point at the headline-checkpoint run from Week 2 (M-ATTN orthomap
-# variant trained on inD+uniD+rounD, ADE=0.318 / FDE=0.800 on the val split).
-# Paths are RELATIVE to the repo root that `ContextVAEInferencer` resolves
-# via the sys.path shim at the top of contextvae_inference.py — but
-# the inferencer accepts absolute paths anyway and we pass absolute paths
-# below for clarity. If the operating recording differs from inD_01, the
-# `CONTEXTVAE_MAP_PICKLE` MUST be updated to point at the matching
-# `data/levelx/map/<recording>.pkl`, otherwise the world-frame coordinates
-# returned by the shim will be inconsistent with the homography the
-# inferencer uses to crop the map.
+# Server-side ContextVAE configuration: the headline M-ATTN orthomap
+# checkpoint trained on inD+uniD+rounD. Paths are absolute, resolved from the
+# repo root. The map pickle must match the recording being replayed; otherwise
+# the shim's world coordinates and the inferencer's map-crop homography
+# disagree.
 # ---------------------------------------------------------------------------
 import os as _os
 _REPO_ROOT = _os.path.normpath(
@@ -87,25 +69,16 @@ _REPO_ROOT = _os.path.normpath(
 )
 CONTEXTVAE_CKPT = _os.path.join(_REPO_ROOT, "tmp", "levelx_full_map_v1", "ckpt-best")
 CONTEXTVAE_CONFIG = _os.path.join(_REPO_ROOT, "configs", "levelx_train.py")
-# For Day 1-2 replay we hard-code the inD_01 recording. A future revision
-# should make this configurable via a CLI arg / env var so the same server
-# binary can replay against different recordings without code edits.
+# Recording is hard-coded to inD_01 for replay; make this a CLI/env option to
+# replay other recordings without code edits.
 CONTEXTVAE_MAP_PICKLE = _os.path.join(_REPO_ROOT, "data", "levelx", "map", "inD_01.pkl")
 
-# Target sampling cadence in milliseconds. ContextVAE is trained on data
-# downsampled to 5 Hz (200 ms per step) — see configs/levelx_train.py and
-# preprocessing/process_levelx.ipynb. If the server's incoming frame rate
-# differs (the Ntousis baseline is ~15-20 Hz onboard), we throttle history
-# pushes to this cadence so the model receives input at the temporal scale
-# it was trained on. Without this throttle, predictions would still have
-# the right shape but at a wrong temporal scale, breaking the wire-protocol
-# step-timestamps.
+# Target sampling cadence (ms). The model is trained at 5 Hz (200 ms/step), so
+# history pushes are throttled to this cadence regardless of the incoming frame
+# rate; feeding input at the wrong temporal scale would break the predictions.
 CONTEXTVAE_TARGET_DT_MS = 200
-# Tolerance for jitter around the 200ms cadence. Allows accepting a frame
-# that arrives a bit early (e.g. 195ms after the last push) without
-# dropping it. Empirically chosen — small enough not to bunch pushes at
-# 100ms apart, large enough not to drop frames due to mild scheduling
-# noise on the UAV side.
+# Jitter tolerance around the 200 ms cadence: accept a frame that arrives
+# slightly early rather than dropping it, without bunching pushes together.
 CONTEXTVAE_DT_TOLERANCE_MS = 20
 
 def check_pwd(conn):
@@ -387,14 +360,11 @@ def lin_interp_older_hist(hist,hist_timestamps,avg_timestep):
 		arr_hist_timestamps=np.insert(arr_hist_timestamps,0,-1)
 	return arr
 
-# `find_neighbors_from_detections` (and its 4-direction detect_* helpers)
-# were removed during the Week 3 Day 1-2 ContextVAE swap. The previous
-# implementation packed 4 directional neighbors into a fixed 10-feature
-# vector for the LSTM. ContextVAE uses radius-based neighbor selection
-# instead — per-track DeepSORT histories filtered by `ob_radius=30m` at
-# the target's metric position. That logic lives in
-# ContextVAEInferencer._build_neighbor_tensor and consumes the per-track
-# history dict that we maintain in the main loop below.
+# The original 4-direction neighbor helpers (find_neighbors_from_detections,
+# detect_up/down/left/right) are gone with the LSTM. ContextVAE instead selects
+# neighbors by radius (ob_radius = 30 m) from per-track DeepSORT histories;
+# that logic lives in ContextVAEInferencer._build_neighbor_tensor and consumes
+# the per-track history maintained in the main loop below.
 
 while 1:
 	time.sleep(0.5)
@@ -436,15 +406,10 @@ while 1:
 					print(addr,"connected")
 				if skip!=1:
 					# --- ContextVAE inferencer + pixel-metric shim setup ---
-					# Both are loaded ONCE per connection. The ContextVAE
-					# checkpoint + map raster live on GPU after this; the
-					# shim's H_inv lives on CPU (it's a 3x3 matmul per call,
-					# not worth a GPU round-trip). model_overrides pins
-					# map_model="resnet18" to match the headline checkpoint
-					# regardless of what configs/levelx_train.py currently
-					# has (the user has been toggling map_model for ablations
-					# during Week 2; the toggle should not affect Week 3
-					# deployment).
+					# Both are loaded once per connection. The checkpoint and map raster
+					# live on GPU; the shim's H_inv stays on CPU (a 3x3 matmul per call).
+					# model_overrides pins map_model="resnet18" to match the headline
+					# checkpoint, regardless of what configs/levelx_train.py currently sets.
 					track_predict_model = ContextVAEInferencer(
 						ckpt_path=CONTEXTVAE_CKPT,
 						config_path=CONTEXTVAE_CONFIG,
@@ -466,14 +431,10 @@ while 1:
 					)
 
 					# --- Per-track rolling history (metric world frame) ---
-					# Dict keyed by DeepSORT track_id -> list of (x_m, y_m)
-					# tuples ordered OLDEST-FIRST, capped at OB_HORIZON
-					# entries. Replaces the old single-target
-					# `interesting_history` buffer of 10-element data lines
-					# (which packed target + 4 directional neighbors per
-					# row). The new structure keeps EVERY confirmed track's
-					# history, so the inferencer can pick neighbors by
-					# radius at inference time without re-doing detection.
+					# Maps DeepSORT track_id -> list of (x_m, y_m), oldest-first, capped at
+					# OB_HORIZON. Unlike the old single-target buffer, this keeps every
+					# confirmed track's history so the inferencer can select neighbors by
+					# radius without redoing detection.
 					track_histories_metric = {}
 
 					# Timestamp (in server's millisecond units) of the most
@@ -483,12 +444,10 @@ while 1:
 					# sees data at the same temporal scale as in training.
 					last_inference_timestamp = -10**9
 
-					tr_pred=[] # ContextVAE predictions for the CURRENT target;
-					           # tensor of shape (12,) in PIXEL coords once
-					           # set — wire-protocol compatible with the
-					           # original LSTM output. Empty list means "no
-					           # prediction yet" (e.g. before 10 history
-					           # frames have accumulated).
+					tr_pred=[] # future positions for the current target: a flat (12,)
+					           # tensor [x1,y1,...,x6,y6] in pixel coords, wire-protocol
+					           # compatible with the old LSTM output. Empty = not ready
+					           # (fewer than OB_HORIZON history frames so far).
 					prev_time=0
 					sum_timestep=0 #in ms
 					timestep_cnt=0
@@ -584,13 +543,12 @@ while 1:
 								t_f_detr=time.time_ns()//1000000
 								img_r=recv_data_tot.copy()
 
-								# Ego-motion compensation hook (Week 3 Day 2-4).
-								# `MovingCameraShim.update_frame` re-estimates H_live->K0
-								# per frame using ORB + USAC_MAGSAC against the canonical
-								# keyframe pulled from the orthomap pickle. The YOLO bbox
-								# list is masked out so dynamic agents don't poison the fit.
-								# All four pixel<->metric calls below transparently respect
-								# the just-updated H. No-op when EGO_MOTION_ENABLED=False.
+								# Ego-motion compensation hook. When enabled,
+								# MovingCameraShim.update_frame re-estimates the live homography
+								# each frame with ORB + USAC_MAGSAC against the keyframe from the
+								# orthomap pickle, masking out YOLO bboxes so moving agents do not
+								# bias the fit. The pixel<->metric calls below then use the updated
+								# homography. No-op when EGO_MOTION_ENABLED is False.
 								if EGO_MOTION_ENABLED:
 									ego_status = pixel_shim.update_frame(
 										recv_data_tot,
@@ -690,11 +648,9 @@ while 1:
 								#   - the target was seen this frame with good IoU
 								#     (so we know the timeline anchor is reliable);
 								#   - and the cadence gate has elapsed.
-								# Synchronizing pushes across tracks keeps neighbor
-								# rows aligned with target rows, which is what
-								# ContextVAE's training-time loader assumes
-								# (data.py:417 iterates over the same `range(...)`
-								# for all agents).
+								# Pushing all tracks on the same frames keeps neighbor rows
+								# aligned with target rows, as ContextVAE's training loader
+								# assumes (one shared time range across all agents).
 								if rec_opt != -1 and target_seen_this_frame and (
 									timestamp - last_inference_timestamp
 									>= CONTEXTVAE_TARGET_DT_MS - CONTEXTVAE_DT_TOLERANCE_MS
@@ -708,12 +664,9 @@ while 1:
 										# burn memory.
 										if len(hist) > OB_HORIZON:
 											del hist[: len(hist) - OB_HORIZON]
-									# Evict tracks that did NOT appear this
-									# frame. The training-time loader uses a
-									# strict "present at every obs frame"
-									# rule for neighbors (data.py:418-431);
-									# we mirror it by dropping any track
-									# that misses an inference tick.
+									# Evict tracks absent this frame, mirroring the training
+									# loader's "present at every observation frame" rule for
+									# neighbors: a track that misses an inference tick is dropped.
 									for stale_tid in list(track_histories_metric.keys()):
 										if stale_tid not in this_frame_metric:
 											del track_histories_metric[stale_tid]
@@ -763,24 +716,16 @@ while 1:
 											last_seen=timestamp
 											last_target_features=target_features_this_frame
 
-											# --- ContextVAE inference --------------------------
-											# Build the target's history in oldest->newest
-											# order. The history was pushed in this same
-											# order by the throttled push block above.
-											# Inference is gated on having a FULL window
-											# (OB_HORIZON entries); we don't run on a
-											# half-filled buffer, since ContextVAE was
-											# trained on 10 obs frames and cold-starting
-											# with fewer would give degraded results.
+											# --- ContextVAE inference ---
+											# Gate inference on a full OB_HORIZON window: the model was
+											# trained on 10 observation frames, and cold-starting with a
+											# half-filled buffer degrades the predictions.
 											target_hist = track_histories_metric.get(interesting_track_id, [])
 											if len(target_hist) >= OB_HORIZON:
 												target_xy = np.array(target_hist[-OB_HORIZON:], dtype=np.float64)  # (10, 2)
-												# Build the per-track-id neighbor dict.
-												# Only include neighbors whose history is
-												# ALSO full (the inferencer's radius filter
-												# operates on (10, 2) arrays). Tracks with
-												# shorter histories simply skip this frame
-												# and get included on a later one.
+												# Collect neighbors whose history is also full; the
+												# inferencer's radius filter needs (OB_HORIZON, 2)
+												# arrays. Shorter tracks are skipped until they fill.
 												neighbor_xy_metric = {}
 												for nb_tid, nb_hist in track_histories_metric.items():
 													if nb_tid == interesting_track_id:
@@ -789,19 +734,15 @@ while 1:
 														neighbor_xy_metric[nb_tid] = np.array(
 															nb_hist[-OB_HORIZON:], dtype=np.float64
 														)
-												# Run the K=5-sample ContextVAE forward.
-												# Returns (PROTOCOL_FUTURE_STEPS, 2) = (6, 2)
-												# in METRIC world coords.
+												# Run the K-sample forward; returns (PROTOCOL_FUTURE_STEPS, 2)
+												# = (6, 2) in metric world coords.
 												future_xy_metric = track_predict_model.infer(
 													target_xy, neighbor_xy_metric
 												)
-												# Convert each future step back to pixel
-												# coords via the same shim used on the
-												# inputs. The wire protocol downstream
-												# (and the relocate_target helper at the
-												# top of this file) reads tr_pred as a
-												# FLAT 12-vector of pixel coords
-												# [x1, y1, x2, y2, ..., x6, y6].
+												# Map each future step back to pixel coords with the same
+												# shim used on the inputs. Downstream (wire protocol and
+												# relocate_target) expects tr_pred as a flat 12-vector
+												# [x1, y1, ..., x6, y6].
 												future_uv = pixel_shim.metrics_to_pixel(future_xy_metric)  # (6, 2)
 												tr_pred = torch.tensor(
 													future_uv.flatten().astype(np.float32),
@@ -809,9 +750,7 @@ while 1:
 												)
 												print("Predicted future track([x1,y1,..,x6,y6]):",
 													[round(n,1) for n in tr_pred.tolist()])
-												# Visualize: draw a small red dot at
-												# each predicted future position. Matches
-												# the original LSTM viz at this point.
+												# Draw a small red dot at each predicted future position.
 												for i in range(tr_pred.shape[0]//2):
 													img_r=cv2.circle(
 														img_r,

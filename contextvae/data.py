@@ -4,16 +4,15 @@ import os, sys
 import torch
 import numpy as np
 import io, pickle
-# CHANGE (2A): functional color-jitter ops (brightness/contrast/saturation) for
-# training-time map augmentation. Functional API used so we can apply per-sample
-# factors via a small Python loop in collate_fn (see _augment_map below).
+# Functional color-jitter ops for training-time map augmentation; the functional
+# API lets us apply per-sample factors in a short loop (see _augment_map).
 import torchvision.transforms.functional as TF
 
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
 
-# Loader worker pool size cap (Pool 1: ProcessPoolExecutor for trajectory file loading).
-# Each spawn worker costs ~1.5 GB RSS — reduce on memory-tight boxes.
+# Worker cap for the trajectory-file loading pool. Each spawned worker costs
+# ~1.5 GB RSS; lower this on memory-tight machines.
 LOADER_MAX_WORKERS = 2
 
 class Dataloader(torch.utils.data.Dataset):
@@ -22,9 +21,10 @@ class Dataloader(torch.utils.data.Dataset):
         def __init__(self, n_batches, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.n_batches = n_batches
-            self.sampler_iter = None #iter(self.sampler)
+            self.sampler_iter = None
         def __iter__(self):
-            # same with BatchSampler, but StopIteration every n batches
+            # Like BatchSampler, but yields exactly n_batches batches per epoch,
+            # cycling the underlying sampler as needed.
             counter = 0
             batch = []
             while True:
@@ -52,10 +52,9 @@ class Dataloader(torch.utils.data.Dataset):
         batch_first: bool=False, seed: Optional[int]=None,
         device: Optional[torch.device]=None,
         flip: bool=False, rotate: bool=False, scale: bool=False,
-        # CHANGE (2A): training-time map-input augmentation flag. Single boolean for
-        # ablation cleanliness — toggles all three transforms (color jitter, rotation
-        # jitter, scale jitter) together. Default False so eval/test datasets remain
-        # deterministic without needing per-config overrides.
+        # Training-time map augmentation. One flag toggles all three transforms
+        # (color jitter, rotation jitter, scale jitter) together; default False
+        # keeps eval/test datasets deterministic.
         map_augment: bool=False,
 
         min_ob_horizon: Optional[int]=None, traj_max_overlap: Optional[int]=None,
@@ -76,10 +75,9 @@ class Dataloader(torch.utils.data.Dataset):
         self.flip = flip and not self.use_map
         self.rotate = rotate and not self.use_map
         self.scale = scale and not self.use_map
-        # CHANGE (2A): map-augment is the dual of the trajectory-side flip/rotate/scale
-        # block above — those are gated to use_map=False to avoid invalidating map
-        # alignment; this one is gated to use_map=True so it has a map to augment.
-        # The two augmentation paths are mutually exclusive by construction.
+        # Trajectory-side flip/rotate/scale are disabled when a map is used, since
+        # they would break map alignment; map augmentation is its complement and
+        # requires a map. The two paths are mutually exclusive by construction.
         self.map_augment = map_augment and bool(self.use_map)
 
         self.device = device
@@ -91,7 +89,6 @@ class Dataloader(torch.utils.data.Dataset):
         if inclusive_groups is None:
             inclusive_groups = [[] for _ in range(len(files))]
         else:
-            # assert(len(inclusive_groups) == len(files))
             inclusive_groups = [inclusive_groups for _ in range(len(files))]
 
         print(" Scanning files...")
@@ -115,7 +112,7 @@ class Dataloader(torch.utils.data.Dataset):
                 map_files = [self.use_map]
             for i, map_file in enumerate(map_files, 1):
                 map_name = os.path.splitext(os.path.basename(map_file))[0]
-                self.map[map_name] = map_file #path
+                self.map[map_name] = map_file   # path for now; loaded lazily below
             self.use_map = True
             print(" {} map file{} founded.".format(len(self.map), "s" if len(self.map) > 1 else ""))
         sys.stdout.write("\r\033[K Loading data files...{}/{}".format(
@@ -139,7 +136,8 @@ class Dataloader(torch.utils.data.Dataset):
                 sys.stdout.write("\r\033[K Loading data files...{}/{} ".format(
                     done, len(data_files)
                 ))
-        # disable augmentation if heading angle is specified
+        # When a heading angle is present, trajectories are already ego-normalized,
+        # so the flip/rotate/scale augmentation is turned off.
         if data[-1][3][1] is not None:
             self.flip = False
             self.rotate = False
@@ -275,15 +273,14 @@ class Dataloader(torch.utils.data.Dataset):
             with torch.no_grad():
                 r = torch.stack(R, 0).to(self.device)
                 m = torch.stack(M, 0).to(self.device)
-                # CHANGE (2A): geometric map augmentation — compose a small per-sample
-                # rotation (uniform ±5°) and isotropic scale jitter (uniform ±10%) INTO
-                # the existing 2x2 heading-rotation block of `r`. Composing into the
-                # same matrix means affine_grid + grid_sample below performs ONE
-                # bilinear sample (not two stacked rotations), avoiding compounded
-                # interpolation aliasing. Scale<1 zooms in (smaller patch extent),
-                # scale>1 zooms out — the model trains against ±10% extent variability
-                # around the canonical 60 m × 60 m crop. self.rng is the seeded
-                # np.random.RandomState shared with the trajectory-side aug block.
+                # Geometric map augmentation: fold a small per-sample rotation
+                # (uniform +/-5 deg) and isotropic scale jitter (uniform +/-10%)
+                # into the heading-rotation block of `r`. Composing into one
+                # matrix keeps affine_grid + grid_sample a single bilinear sample,
+                # avoiding the aliasing of two stacked rotations. Scale < 1 zooms
+                # in, scale > 1 zooms out, so the model sees +/-10% extent variation
+                # around the canonical 60 m crop. self.rng is the seeded RNG shared
+                # with the trajectory-side augmentation.
                 if self.map_augment:
                     B = r.size(0)
                     aug_angles = self.rng.uniform(-5.0, 5.0, size=B) * np.pi / 180.0
@@ -300,11 +297,10 @@ class Dataloader(torch.utils.data.Dataset):
                 grid = torch.nn.functional.affine_grid(r, m.size(), align_corners=False)
                 m = torch.nn.functional.grid_sample(m, grid, align_corners=False)
                 m = m[..., self.TOP:self.BOTTOM, self.LEFT:self.RIGHT]
-                # CHANGE (2A): color jitter on the rotated, final-cropped tensor.
-                # Applied here (not pre-grid_sample on the 404x404 raw) so it touches
-                # the smaller 224x224 tensor and cannot interact with grid_sample's
-                # edge-padding. Must run BEFORE the unsqueeze_(0) below since the
-                # helper expects [B, 3, H, W].
+                # Color jitter on the rotated, final-cropped tensor. Done after the
+                # crop so it touches the smaller patch and cannot interact with
+                # grid_sample's edge padding, and before the unsqueeze_(0) below so
+                # the helper still sees a [B, 3, H, W] tensor.
                 if self.map_augment:
                     m = self._augment_map(m)
                 m = m.unsqueeze_(0)
@@ -314,13 +310,11 @@ class Dataloader(torch.utils.data.Dataset):
             ret.append(seq_len)
         return ret
 
-    # CHANGE (2A): per-sample color jitter helper. Brightness/contrast/saturation
-    # factors are drawn independently per agent in the batch from U[0.8, 1.2] —
-    # matching the torchvision ColorJitter convention (factor=1.0 is identity,
-    # ±0.2 is the doc-recommended magnitude). Loop over batch is cheap (B≤256,
-    # GPU ops) and lets us reuse torchvision's well-tested functional API rather
-    # than rolling our own per-channel saturation math. The map raster lives in
-    # [-1, 1] but TF.adjust_* expects [0, 1], so we shift before/after and clamp.
+    # Per-sample color jitter. Brightness/contrast/saturation factors are drawn
+    # independently per agent from U[0.8, 1.2] (torchvision ColorJitter convention:
+    # 1.0 is identity, +/-0.2 is the recommended magnitude). The per-sample loop is
+    # cheap and reuses torchvision's functional ops. TF.adjust_* expects [0, 1],
+    # so the raster is shifted out of [-1, 1] and back, with a final clamp.
     def _augment_map(self, m):
         # m: [B, 3, H, W] in [-1, 1]
         B = m.size(0)
@@ -346,7 +340,7 @@ class Dataloader(torch.utils.data.Dataset):
             if self.preload_map:
                 semantic_map, H = self.map[map_name]
             else:
-                buf = self.map[map_name] #self.load_map(self.map[map_name])
+                buf = self.map[map_name]
                 if type(buf) == str:
                     semantic_map, H = self.load_map(buf, compressed=False)
                 else: 
@@ -354,6 +348,10 @@ class Dataloader(torch.utils.data.Dataset):
                     loaded = np.load(buf)
                     semantic_map = torch.tensor(loaded["M"], dtype=torch.float32)
                     H = loaded["H"]
+            # Map the agent's first observed position to a pixel (row, col) via the
+            # recording homography H, then cut a square patch of half-size EXT around
+            # it. `rot` carries the heading rotation applied later by affine_grid in
+            # collate_fn, yielding an agent-centered, heading-aligned crop.
             x_center, y_center = hist[0][0], hist[0][1]
             r, c, _ = H @ [x_center, y_center, 1]
             r = int(np.floor(r))
@@ -363,7 +361,7 @@ class Dataloader(torch.utils.data.Dataset):
                 [cos, -sin, 0],
                 [sin,  cos, 0],
             ], dtype=torch.float32)
-            semantic_map = semantic_map[:, r-self.EXT:r+self.EXT, c-self.EXT:c+self.EXT]#.clone().detach()
+            semantic_map = semantic_map[:, r-self.EXT:r+self.EXT, c-self.EXT:c+self.EXT]
             return hist, future, neighbor, semantic_map, rot, seq_len
         return hist, future, neighbor, seq_len
 
@@ -378,8 +376,9 @@ class Dataloader(torch.utils.data.Dataset):
         time = np.sort(list(data.keys()))
         if len(time) < min_horizon+1: return None
 
-        # extend the observation radius a little bit to prevent computation errors
-        ob_radius = None if self.ob_radius is None else self.ob_radius + 0.5 
+        # Pad the observation radius slightly to avoid dropping neighbors that sit
+        # right on the boundary due to floating-point rounding.
+        ob_radius = None if self.ob_radius is None else self.ob_radius + 0.5
 
         info_file = filename.replace(".txt", ".info")
         if os.path.exists(info_file):
@@ -421,17 +420,17 @@ class Dataloader(torch.utils.data.Dataset):
                     if not idx_curr: # interrupted by empty frame
                         idx_ego = []
                         if i >= ob_gap: break
-                    idx_ego = np.intersect1d(idx_ego, idx_curr) # remove those not appear at current frame
+                    idx_ego = np.intersect1d(idx_ego, idx_curr) # keep only agents present in this frame
                     if i <= ob_gap:
                         for idx in idx_curr:
                             if idx not in idx_ego:
                                 first_frame[idx] = (i, tid)
-                        idx_ego = np.union1d(idx_ego, idx_curr) # add to ego agent list if it appears at available observation phase
+                        idx_ego = np.union1d(idx_ego, idx_curr) # admit agents seen during the observation phase
                     if i >= ob_gap and len(idx_ego) == 0:
                         break
                     idx_all.extend(data[t].keys())
                 if self.min_ob_horizon != self.ob_horizon:
-                    tid_next = tid_end+self.frameskip  # remove those whose length is shorter than the observation windows but whose actually trajectory length is longer 
+                    tid_next = tid_end+self.frameskip  # drop agents whose window is short here but whose full track extends further
                     if tid_next < e and tid_next < len(time) and time[tid_next] in data:
                         removed = []
                         for idx in idx_ego:
@@ -449,9 +448,12 @@ class Dataloader(torch.utils.data.Dataset):
                             timestamp[idx] = tid_end - (self.traj_max_overlap-1)*self.frameskip
                     idx_ego = np.setdiff1d(idx_ego, overlapped)
                 if len(idx_ego):
-                    data_dim = 6 # x, y, vx, vy, ax, ay
+                    data_dim = 6 # state is x, y, vx, vy, ax, ay
                     heading_dim_index = 6
                     neighbor_idx = np.setdiff1d(idx_all, idx_ego)
+                    # Stack every frame into a dense (ego + neighbor) x state array.
+                    # Timesteps where an agent is absent are filled with the 1e9
+                    # sentinel so the ob_radius mask discards them downstream.
                     if len(idx_ego) == 1 and len(neighbor_idx) == 0:
                         idx = idx_ego[0]
                         agents = np.array([
@@ -463,7 +465,7 @@ class Dataloader(torch.utils.data.Dataset):
                             [data[time[tid]][i][:data_dim] if time[tid] in data and i in data[time[tid]] and tid >= 0 else [1e9]*data_dim for i in idx_ego] +
                             [data[time[tid]][j][:data_dim] if time[tid] in data and j in data[time[tid]] else [1e9]*data_dim for j in neighbor_idx]
                             for tid in range(tid_start, tid_end+1, self.frameskip)
-                        ])  # L X N x 6
+                        ])  # L x N x 6
                     for i, idx in enumerate(idx_ego):
                         heading = data[time[first_frame[idx][1]]][idx][heading_dim_index]
                         hist = agents[:self.ob_horizon,i]  # L_ob x 6
@@ -478,7 +480,9 @@ class Dataloader(torch.utils.data.Dataset):
                             neighbor = neighbor[:, valid]
 
                         if first_frame[idx][0] > 0:
-                            # pad the observation if the observation horizon is less than the maximal horizon setting
+                            # Agent appears after the window start: left-pad the
+                            # observation to a fixed ob_horizon and record the true
+                            # length in seq_len (the model masks the padding).
                             seq_len = self.ob_horizon - first_frame[idx][0]
                             padded_hist = np.zeros_like(hist)
                             padded_hist[:seq_len] = hist[-seq_len:]
@@ -501,7 +505,9 @@ class Dataloader(torch.utils.data.Dataset):
 
         for hist, future, neighbor, (map_name, angle), seq_len in traj:
             if angle is not None:
-                # localize the trajectory according to heading angle
+                # Ego-normalize: translate so the first observed point is the
+                # origin, rotate by the heading, then translate back. This aligns
+                # every trajectory to a common heading-relative frame.
                 x0 = hist[0][0]
                 y0 = hist[0][1]
                 s, c = np.sin(angle), np.cos(angle)
@@ -538,6 +544,9 @@ class Dataloader(torch.utils.data.Dataset):
         return semantic_map, H
 
     def extend(self, data, frameskip):
+        # Fill gaps in the frame timeline, drop single-frame detections, and
+        # derive velocity and acceleration by finite differences so every row
+        # carries the full (x, y, vx, vy, ax, ay) state.
         time = np.sort(list(data.keys()))
         dts = np.unique(time[1:] - time[:-1])
         dt = dts.min()
@@ -548,7 +557,7 @@ class Dataloader(torch.utils.data.Dataset):
             if time[i+1] - time[i] != dt:
                 time = np.insert(time, i+1, time[i]+dt)
             i += 1
-        # ignore those only appearing at one frame
+        # Drop agents seen in only a single frame (no neighbor in time).
         for tid, t in enumerate(time):
             removed = []
             if t not in data: data[t] = {}
@@ -560,7 +569,7 @@ class Dataloader(torch.utils.data.Dataset):
                     removed.append(idx)
             for idx in removed:
                 data[t].pop(idx)
-        # extend v
+        # Velocity by forward difference of position (per frameskip step).
         for tid in range(len(time)-frameskip):
             t0 = time[tid]
             t1 = time[tid+frameskip]
@@ -577,7 +586,7 @@ class Dataloader(torch.utils.data.Dataset):
                 if tid < frameskip or i not in data[time[tid-1]]:
                     data[t0][i].insert(2, vx)
                     data[t0][i].insert(3, vy)
-        # extend a
+        # Acceleration by forward difference of velocity (per frameskip step).
         for tid in range(len(time)-frameskip):
             t_1 = None if tid < frameskip else time[tid-frameskip]
             t0 = time[tid]
@@ -593,7 +602,7 @@ class Dataloader(torch.utils.data.Dataset):
                 data[t1][i].insert(4, ax)
                 data[t1][i].insert(5, ay)
                 if t_1 is None or i not in data[t_1]:
-                    # first appearing frame, pick value from the next frame
+                    # No earlier frame to difference against: reuse the next step's value.
                     data[t0][i].insert(4, ax)
                     data[t0][i].insert(5, ay)
         return data

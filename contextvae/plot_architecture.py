@@ -1,17 +1,17 @@
-"""Render the thesis Chapter 3/4 architecture diagrams.
+"""Render the architecture diagrams used in the methodology chapter.
 
-All seven diagrams listed in the plan file are emitted as PNGs into ``--out-dir``
-(default ``tmp/figs``).  Each diagram is a self-contained matplotlib block
-drawing — no data is read from disk — so the figures regenerate deterministically.
+Each diagram is a self-contained matplotlib drawing (no data is read from
+disk), so the figures regenerate deterministically into ``--out-dir``
+(default ``tmp/figs``).
 
 Outputs:
-- ``arch_c1_system.png``         End-to-end UAV → server → UAV (C1)
-- ``arch_c2_contextvae.png``     ContextVAE forward pass (C2)
-- ``arch_c3_mattn.png``          M-ATTN orthomap encoder (C3)
-- ``arch_c4_sattn.png``          S-ATTN social attention block (C4)
-- ``arch_c5_lstm_swap.png``      LSTM → ContextVAE Ntousis swap (C5)
-- ``arch_c6_egomotion.png``      Ego-motion shim 3-stage chain (C6)
-- ``arch_c7_timing.png``         Rolling-window timing (C7)
+- ``arch_c1_system.png``         End-to-end UAV -> server -> UAV
+- ``arch_c2_contextvae.png``     ContextVAE forward pass
+- ``arch_c3_mattn.png``          M-ATTN orthomap encoder
+- ``arch_c4_sattn.png``          S-ATTN social attention block
+- ``arch_c5_lstm_swap.png``      LSTM -> ContextVAE predictor swap
+- ``arch_c6_egomotion.png``      Ego-motion shim 3-stage homography chain
+- ``arch_c7_timing.png``         Rolling-window inference timing
 """
 
 import argparse
@@ -23,7 +23,7 @@ import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 
-# Consistent palette across all diagrams.
+# Shared palette so block types read consistently across all diagrams.
 PALETTE = {
     "input":  "#cfe2f3",   # light blue
     "embed":  "#fce5cd",   # light orange
@@ -31,8 +31,8 @@ PALETTE = {
     "rnn":    "#d9ead3",   # light green
     "latent": "#d9d2e9",   # light purple
     "output": "#e6e6e6",   # gray
-    "ours":   "#fff2cc",   # light yellow (highlight contribution)
-    "removed": "#f9d6d5",  # pinkish (struck-through)
+    "ours":   "#fff2cc",   # light yellow: highlights our contribution
+    "removed": "#f9d6d5",  # pinkish: component removed from the baseline
 }
 EDGE = "#333333"
 
@@ -50,7 +50,7 @@ def _box(ax, x, y, w, h, text, color="#cfe2f3", fontsize=9, italic=False,
     if strike:
         from matplotlib import patheffects as pe
         txt.set_path_effects([pe.withStroke(linewidth=0)])
-        # Draw a strike line through the text centre.
+        # Strike line through the text center marks a removed component.
         ax.plot([x + 0.1, x + w - 0.1], [y + h / 2, y + h / 2],
                 color="#cc0000", lw=1.0, alpha=0.7)
     return (x, y, w, h)
@@ -95,53 +95,47 @@ def plot_c1(out_dir):
                      title="End-to-end UAV trajectory-prediction system "
                            "(thesis adaptation of Ntousis 2024)")
 
-    # Onboard track (top row).
+    # Onboard pipeline (top row).
     _box(ax, 0.2, 4.5, 1.8, 0.9, "UAV\ncamera", PALETTE["input"])
     _box(ax, 2.2, 4.5, 2.4, 0.9, "RPi 4B + NCS2\nYOLOv5n + KCF\n~20 FPS",
          PALETTE["embed"])
     _arrow(ax, (2.0, 4.95), (2.2, 4.95))
     _arrow(ax, (4.6, 4.95), (5.4, 4.95), label="bbox + crop", label_fontsize=8)
 
-    # Network up.
     _box(ax, 5.4, 4.5, 1.6, 0.9, "Network\nuplink",
          PALETTE["output"], italic=True)
     _arrow(ax, (7.0, 4.95), (7.6, 4.95))
 
-    # Server side.
+    # Server-side detection and tracking.
     _box(ax, 7.6, 4.5, 2.4, 0.9, "YOLOv8x + DeepSORT\n(A40, ~15 FPS)",
          PALETTE["embed"])
-
-    # Down from server detection to coord+model row.
     _arrow(ax, (8.8, 4.5), (8.8, 3.7), label="track centroids (px)",
            label_offset=(1.4, 0.0))
 
-    # Coord shim row.
+    # Pixel -> metric / ego-motion compensation (new code).
     _box(ax, 6.5, 2.8, 3.0, 0.9,
          "PixelMetricShim  |  MovingCameraShim\n(ORB+MAGSAC, 3-stage H)",
          PALETTE["ours"])
     _arrow(ax, (8.0, 2.8), (8.0, 2.0), label="(x,y) metric, world frame",
            label_offset=(1.5, 0.0))
 
-    # ContextVAE inferencer.
+    # ContextVAE prediction (new code).
     _box(ax, 5.5, 1.1, 5.0, 0.9,
          "ContextVAEInferencer  —  K=20 sampling, ResNet-18 M-ATTN\n"
          "input: x (10 obs), neighbors (radius 30m), heading-rotated orthomap",
          PALETTE["ours"])
-
-    # Down to wire emission.
     _arrow(ax, (8.0, 1.1), (8.0, 0.55), label="6 future waypoints",
            label_offset=(1.0, 0.0))
 
-    # Network down.
     _box(ax, 6.5, 0.0, 3.0, 0.55, "downlink → RPi guidance loop",
          PALETTE["output"], italic=True)
 
-    # Loop back up to UAV.
+    # Control loop back to the UAV.
     _arrow(ax, (6.5, 0.27), (1.1, 0.27), curve=-0.15,
            label="control set-point", label_offset=(0.0, -0.3))
     _arrow(ax, (1.1, 0.55), (1.1, 4.5))
 
-    # Code-path annotations.
+    # Source-file annotations.
     ax.text(0.1, 5.7,
             "Onboard: server_code_only/main_program/...",
             fontsize=7, style="italic", color="#888888")
@@ -168,7 +162,7 @@ def plot_c2(out_dir):
                      title="ContextVAE forward pass — timewise latent $z_t$, "
                            "S-ATTN + M-ATTN, training (solid) vs inference (dashed P/Q)")
 
-    # ---- Inputs row.
+    # Inputs row.
     _box(ax, 0.3, 6.6, 1.6, 0.8, "$x$ : (L1+1, N, 6)\nobs state",
          PALETTE["input"])
     _box(ax, 2.1, 6.6, 2.4, 0.8,
@@ -181,7 +175,7 @@ def plot_c2(out_dir):
          "$y$ : (L2, N, 2)\n(training only)",
          PALETTE["input"])
 
-    # ---- Embedding layer.
+    # Embedding layer.
     _box(ax, 0.3, 5.4, 1.6, 0.7, "embed_s\n→ 128", PALETTE["embed"])
     _box(ax, 2.1, 5.4, 1.4, 0.7, "embed_n\n→ 128", PALETTE["embed"])
     _box(ax, 3.6, 5.4, 1.6, 0.7, "embed_k\n→ 256 (keys)", PALETTE["embed"])
@@ -194,7 +188,7 @@ def plot_c2(out_dir):
     _arrow(ax, (3.3, 6.6), (4.4, 6.1))
     _arrow(ax, (5.6, 6.6), (6.4, 6.1))
 
-    # ---- S-ATTN box.
+    # S-ATTN social attention and map-conditioned init.
     _box(ax, 2.6, 4.1, 2.6, 0.8,
          "S-ATTN\nsoftmax($q^\\top k$, mask 1e9→−∞)",
          PALETTE["attn"])
@@ -205,7 +199,7 @@ def plot_c2(out_dir):
     _arrow(ax, (4.4, 5.4), (4.4, 4.9))
     _arrow(ax, (6.4, 5.4), (6.4, 4.9))
 
-    # ---- Encoder RNN (forward over L1).
+    # Forward encoder GRU over the observation window.
     _box(ax, 2.6, 2.8, 4.8, 0.9,
          "rnn_fx (forward GRU over L1=10 obs frames)\n"
          "hidden $h_t$ ∈ ℝ^{512}",
@@ -214,7 +208,7 @@ def plot_c2(out_dir):
     _arrow(ax, (1.1, 5.4), (3.0, 3.7), curve=-0.2)
     _arrow(ax, (6.4, 4.1), (5.8, 3.7))
 
-    # ---- Backward encoder (future, training only).
+    # Backward encoder over the future window (training only).
     _box(ax, 7.7, 5.0, 3.2, 0.9,
          "rnn_by (backward GRU over L2=25)\n"
          "$b_t$ ∈ ℝ^{256}  — training only",
@@ -222,7 +216,7 @@ def plot_c2(out_dir):
     _arrow(ax, (7.6, 7.0), (9.3, 5.9), dashed=True, label="future neighbors\n+ ego-state",
            label_offset=(1.4, 0.4))
 
-    # ---- Per-t decoder loop box.
+    # Per-timestep decoder loop.
     _box(ax, 9.4, 0.6, 3.3, 3.6,
          "",
          PALETTE["latent"], lw=1.6)
@@ -242,22 +236,21 @@ def plot_c2(out_dir):
     _arrow(ax, (11.05, 2.3), (11.05, 2.0))
     _arrow(ax, (11.05, 1.4), (11.05, 1.25))
 
-    # h enters the loop.
+    # h enters the loop; b enters only during training.
     _arrow(ax, (7.4, 3.2), (9.6, 3.5), label="$h$", label_offset=(-1.0, 0.0))
-    # b enters the loop (training only).
     _arrow(ax, (9.0, 5.0), (11.7, 3.8), dashed=True)
-    # Recurrent feedback inside loop.
+    # Recurrent hidden-state feedback within the loop.
     _arrow(ax, (12.4, 0.95), (12.7, 2.0), curve=0.35)
     _arrow(ax, (12.7, 2.0), (10.3, 3.4), curve=0.35,
            label="$h_{t+1}$", label_offset=(-0.4, 0.4))
 
-    # ---- Output.
+    # Predicted trajectory output.
     _box(ax, 4.0, 0.6, 4.0, 0.7,
          "$\\hat{y}_{1..H}$ — predicted trajectory  (H=25 = 5 s @ 5 Hz)",
          PALETTE["output"])
     _arrow(ax, (9.4, 0.95), (8.0, 0.95))
 
-    # KL annotation.
+    # ELBO objective.
     ax.text(11.05, 4.55,
             "$\\mathcal{L} = \\sum_t \\|\\hat{y}_t-y_t\\|_2^2 + \\beta\\,KL(Q_Z\\|P_Z)$",
             ha="center", fontsize=8, color="#555555")
@@ -282,7 +275,7 @@ def plot_c3(out_dir):
     fig, ax = _setup((12, 4.5), (0, 12), (0, 4.5),
                      title="M-ATTN — aerial-orthomap encoder (Chapter 3 contribution)")
 
-    # Left: contrast with paper's HD raster.
+    # Left: contrast the paper's HD raster input with our orthomap patch.
     _box(ax, 0.2, 3.0, 2.6, 1.2,
          "Paper (Xu 2023)\nHD semantic raster\n(lanes, road edges)",
          PALETTE["removed"])
@@ -291,7 +284,7 @@ def plot_c3(out_dir):
          PALETTE["ours"])
     ax.text(1.5, 2.65, "vs", ha="center", fontsize=10, style="italic")
 
-    # Center: forward path.
+    # Center: encoder forward path.
     _box(ax, 3.6, 1.8, 1.8, 0.9,
          "heading-rotated\ncrop ~30 m × 30 m",
          PALETTE["input"])
@@ -305,14 +298,13 @@ def plot_c3(out_dir):
     _arrow(ax, (7.6, 2.25), (8.0, 2.25))
     _arrow(ax, (10.0, 2.25), (10.3, 2.25))
 
-    # Down to fusion.
+    # Fuse the map feature with the attended-neighbor feature into h_0.
     _arrow(ax, (11.0, 1.8), (11.0, 1.0))
     _box(ax, 7.5, 0.3, 4.3, 0.7,
          "fuse with attended-neighbor (256)  →  initial $h_0 \\in \\mathbb{R}^{512}$",
          PALETTE["rnn"])
-    _arrow(ax, (9.5, 1.0), (9.5, 1.0 - 0.0))  # dummy
+    _arrow(ax, (9.5, 1.0), (9.5, 1.0 - 0.0))  # zero-length placeholder
 
-    # Code reference.
     ax.text(8.0, 3.55,
             "code: contextvae/context_vae.py — MapEncode class (lines 121–183)",
             fontsize=8, style="italic", color="#555555")
@@ -343,7 +335,7 @@ def plot_c4(out_dir):
     _arrow(ax, (2.3, 3.8), (3.0, 3.8))
     _arrow(ax, (2.3, 2.4), (3.0, 2.4))
 
-    # Score block.
+    # Attention-score block.
     _box(ax, 5.6, 2.6, 1.8, 0.8,
          "$e_{ij} = k_{ij}^\\top q_i$",
          PALETTE["attn"])
@@ -382,7 +374,7 @@ def plot_c5(out_dir):
     fig, ax = _setup((13, 6.5), (0, 13), (0, 6.5),
                      title="From Ntousis (2024) LSTM predictor to ContextVAE — what changes")
 
-    # ----------------- LEFT: Ntousis LSTM stack.
+    # Left column: baseline Ntousis LSTM stack.
     ax.text(3.0, 6.1, "Ntousis (2024) — baseline", ha="center",
             fontsize=11, weight="bold")
     _box(ax, 0.5, 5.0, 5.0, 0.6,
@@ -408,7 +400,7 @@ def plot_c5(out_dir):
                         (1.0, 0.65)]:
         _arrow(ax, (3.0, y_top), (3.0, y_bot))
 
-    # ----------------- RIGHT: ContextVAE stack.
+    # Right column: ContextVAE replacement stack.
     ax.text(10.0, 6.1, "This thesis — ContextVAE adaptation", ha="center",
             fontsize=11, weight="bold")
     _box(ax, 7.5, 5.0, 5.0, 0.6,
@@ -434,7 +426,7 @@ def plot_c5(out_dir):
                         (1.0, 0.65)]:
         _arrow(ax, (10.0, y_top), (10.0, y_bot))
 
-    # Center arrow / labels showing what's removed / added.
+    # Center arrow marking the predictor swap.
     ax.annotate("",
                 xy=(7.3, 3.0), xytext=(5.7, 3.0),
                 arrowprops=dict(arrowstyle="->", color="#777777", lw=1.4))
@@ -458,7 +450,7 @@ def plot_c6(out_dir):
                      title="MovingCameraShim — 3-stage homography chain "
                            "(live frame → keyframe Kc → keyframe K0 → world)")
 
-    # Stage boxes.
+    # Frame stages along the homography chain.
     _box(ax, 0.2, 2.5, 2.4, 1.2,
          "Live frame\n$F_t$\n(BGR, 1920×1080)",
          PALETTE["input"])
@@ -472,7 +464,7 @@ def plot_c6(out_dir):
          "World frame\n(metric, +y up)",
          PALETTE["output"])
 
-    # Arrows with H labels.
+    # Per-stage homographies.
     _arrow(ax, (2.6, 3.1), (3.5, 3.1),
            label="$H_{F_t \\to K_c}$\nORB+MAGSAC", label_offset=(0.0, 0.55),
            label_fontsize=8)
@@ -527,7 +519,7 @@ def plot_c7(out_dir):
         ax.plot([tx], [3.0], marker="|", markersize=10, color="black")
     ax.text(t_max + 0.1, 3.0, "wall time →", va="center", fontsize=9)
 
-    # Detection ticks (every 50 ms ~ 20 FPS).
+    # Detection ticks: every 50 ms (~20 FPS).
     det_pts = [(1.0 + 0.275 * i, 3.45) for i in range(0, 40)]
     for x, y in det_pts:
         if x > t_max:
@@ -536,7 +528,7 @@ def plot_c7(out_dir):
     ax.text(t_max + 0.1, 3.45, "YOLO+DeepSORT (20 FPS, 50 ms)",
             va="center", fontsize=8, color="#1f77b4")
 
-    # ContextVAE inference (every 200 ms ~ 5 Hz).
+    # ContextVAE inference ticks: every 200 ms (5 Hz).
     inf_pts = [(1.0 + 1.1 * i, 2.55) for i in range(0, 11)]
     for x, y in inf_pts:
         if x > t_max:
@@ -546,7 +538,7 @@ def plot_c7(out_dir):
             "ContextVAEInferencer (5 Hz, 200 ms)  — 27 ms median latency on A40",
             va="center", fontsize=8, color="#d62728")
 
-    # Observation window (sliding).
+    # Sliding observation window.
     obs_x_start = 4.0
     obs_x_end = 6.2
     _box(ax, obs_x_start, 1.4, obs_x_end - obs_x_start, 0.6,
@@ -566,7 +558,6 @@ def plot_c7(out_dir):
 
     _arrow(ax, (6.3, 1.5), (6.3, 1.0))
 
-    # Annotation: 5 Hz cadence enforced.
     ax.text(2.0, 0.2,
             "History pushed only every CONTEXTVAE_TARGET_DT_MS = 200 ms "
             "→ matches training cadence (no resampling mismatch).",

@@ -121,18 +121,11 @@ class ContextVAE(torch.nn.Module):
             class MapEncode(torch.nn.Module):
                 def __init__(self):
                     super().__init__()
-                    # CHANGE (1A): load ImageNet-pretrained weights instead of random init.
-                    # The aerial-orthomap variant trains on ~10 GB of inD/uniD/rounD imagery,
-                    # which is too small to train a ResNet from scratch effectively. ImageNet
-                    # weights provide modality-agnostic low-level features (edges, textures,
-                    # shapes) that transfer well to top-down drone imagery despite the
-                    # perspective shift. `weights="DEFAULT"` resolves to the current best
-                    # checkpoint per torchvision (e.g. ResNet18_Weights.IMAGENET1K_V1).
-                    # Caveat: this assumes `map_model` is a torchvision FACTORY function
-                    # (resnet*, mobilenet_v3_*, efficientnet_b*). The `mobile2`/`m2` branch
-                    # imports the MobileNetV2 *class*, which does not accept `weights=` —
-                    # that branch is dead code under current configs/levelx_*.py (which use
-                    # resnet18) but should be fixed if reactivated.
+                    # Initialize the map backbone from ImageNet-pretrained weights.
+                    # The aerial-orthomap data (inD/uniD/rounD, ~10 GB) is too small
+                    # to train a ResNet from scratch; ImageNet low-level features
+                    # (edges, textures) transfer well to top-down drone imagery.
+                    # "DEFAULT" selects torchvision's current best checkpoint.
                     self.backbone = map_model(weights="DEFAULT")
                     n_params = 0
                     for m in self.backbone.parameters():
@@ -149,14 +142,13 @@ class ContextVAE(torch.nn.Module):
                     elif "eff" in map_model_name:
                         self.feature_dim = self.backbone.classifier[1].in_features
                         self.backbone.classifier = torch.nn.Identity()
-                    # CHANGE (1A): register ImageNet input-normalization stats as buffers.
-                    # The orthomap raster arrives in [-1, 1] (normalized that way during
-                    # preprocessing in process_levelx.ipynb), but ImageNet-pretrained CNNs
-                    # were trained on images in [0, 1] then per-channel (x - mean)/std with
-                    # mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]. Renormalizing
-                    # at the input converges noticeably faster than letting fine-tuning
-                    # drift the learned BN stats. Buffers (not Parameters) ride .cuda()/.to()
-                    # automatically and are saved/loaded with state_dict but are not trained.
+                    # Input-normalization statistics for the pretrained backbone.
+                    # The orthomap raster arrives in [-1, 1] from preprocessing,
+                    # whereas ImageNet backbones expect [0, 1] shifted by these
+                    # per-channel mean/std. Renormalizing at the input converges
+                    # faster than letting fine-tuning drift the learned BN stats.
+                    # Registered as buffers: they follow .to()/.cuda() and persist
+                    # in state_dict, but are not trained.
                     self.register_buffer(
                         "imagenet_mean",
                         torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
@@ -171,13 +163,13 @@ class ContextVAE(torch.nn.Module):
                             m = map.view(-1, map.size(-3), map.size(-2), map.size(-1))
                         else:
                             m = torch.reshape(map, (-1, map.size(-3), map.size(-2), map.size(-1)))
-                        # CHANGE (1A): [-1, 1] -> [0, 1] -> ImageNet-normalized.
-                        # Broadcasting: m is (B, 3, H, W), buffers are (1, 3, 1, 1).
+                        # [-1, 1] -> [0, 1] -> ImageNet-normalized.
+                        # m is (B, 3, H, W); the buffers broadcast as (1, 3, 1, 1).
                         m = (m + 1.0) * 0.5
                         m = (m - self.imagenet_mean) / self.imagenet_std
                         m = self.backbone(m)
                         return m.view(list(map.shape[:-3]) + [self.feature_dim])
-                    # CHANGE (1A): same renormalization on the 4-D path.
+                    # Same renormalization for the already-4-D input.
                     m = (map + 1.0) * 0.5
                     m = (m - self.imagenet_mean) / self.imagenet_std
                     return self.backbone(m)
@@ -191,19 +183,19 @@ class ContextVAE(torch.nn.Module):
         self.dec = ContextVAE.DecoderZH(z_dim, hidden_dim_fy, hidden_dim_fy, d_dim)
 
         self.embed_s = torch.nn.Sequential(
-            torch.nn.Linear(4, 64),             # v, a
+            torch.nn.Linear(4, 64),             # self state: velocity, acceleration
             torch.nn.ReLU6(),
             torch.nn.Linear(64, self_embed_dim)
         )
         self.embed_n = torch.nn.Sequential(
-            torch.nn.Linear(4, 64),             # dp, dv
+            torch.nn.Linear(4, 64),             # neighbor state: rel. position, rel. velocity
             torch.nn.ReLU6(),
             torch.nn.Linear(64, neighbor_embed_dim),
             torch.nn.ReLU6(),
             torch.nn.Linear(neighbor_embed_dim, neighbor_embed_dim)
         )
         self.embed_k = torch.nn.Sequential(
-            torch.nn.Linear(3, feature_dim),    # dist, bear angle, mpd
+            torch.nn.Linear(3, feature_dim),    # attention key: distance, bearing, min. predicted distance
             torch.nn.ReLU6(),
             torch.nn.Linear(feature_dim, feature_dim),
             torch.nn.ReLU6(),
@@ -221,7 +213,7 @@ class ContextVAE(torch.nn.Module):
         self.rnn_fx = torch.nn.GRU(self_embed_dim+neighbor_embed_dim, hidden_dim_fx)
         init_dim = hidden_dim_fx//2 if self.use_map else hidden_dim_fx
         self.rnn_fx_init = torch.nn.Sequential(
-            torch.nn.Linear(2, init_dim), # dp
+            torch.nn.Linear(2, init_dim), # from the initial relative position
             torch.nn.ReLU6(),
             torch.nn.Linear(init_dim, init_dim*self.rnn_fx.num_layers),
             torch.nn.ReLU6(),
@@ -244,15 +236,16 @@ class ContextVAE(torch.nn.Module):
                 torch.nn.ReLU6(),
                 torch.nn.Linear(self.map_encode.feature_dim, self.rnn_fx_init[-1].out_features)
             )
-            self.rnn_fx_init_k = torch.nn.Sequential( # same with self.rnn_fx_init
-                # MaskedBatchNorm1d(2),
-                torch.nn.Linear(2, self.rnn_fx_init[-1].out_features//self.rnn_fx.num_layers), # dp
+            self.rnn_fx_init_k = torch.nn.Sequential( # attention keys over neighbors, from relative position
+                torch.nn.Linear(2, self.rnn_fx_init[-1].out_features//self.rnn_fx.num_layers),
                 torch.nn.ReLU6(),
                 torch.nn.Linear(self.rnn_fx_init[-1].out_features//self.rnn_fx.num_layers, self.rnn_fx_init[-1].out_features),
                 torch.nn.ReLU6(),
                 torch.nn.Linear(self.rnn_fx_init[-1].out_features, self.rnn_fx_init[-1].out_features),
             )
-            self.rnn_fx_init_map = torch.nn.Sequential( # init hidden state = (rnn_fx_init(dp), rnn_fx_init_map(map))
+            # With a map, the encoder's initial hidden state concatenates a social
+            # half (attention over neighbors) and a map half (rnn_fx_init_map(map)).
+            self.rnn_fx_init_map = torch.nn.Sequential(
                 torch.nn.Linear(self.map_encode.feature_dim, self.map_encode.feature_dim),
                 torch.nn.ReLU6(),
                 torch.nn.Linear(self.map_encode.feature_dim, self.map_encode.feature_dim),
@@ -301,7 +294,8 @@ class ContextVAE(torch.nn.Module):
             dp = neighbor_x - x.unsqueeze(-2)       # (L+1) x N x Nn x 2
             dv = neighbor_v - v.unsqueeze(-2)       # L x N x Nn x 2
 
-            # social features
+            # Social features per neighbor: distance, bearing, and minimum
+            # predicted distance (closest approach under constant velocity).
             dist = dp.norm(dim=-1)                          # (L+1) x N x Nn
             mask = dist <= self.ob_radius
             dp0, mask0 = dp[0], mask[0]
@@ -323,18 +317,12 @@ class ContextVAE(torch.nn.Module):
         h = self.rnn_fx_init(dp0)                           # N x Nn x d
 
 
-        # CHANGE (1B): map-input dropout. With probability 0.15 during training, replace
-        # the entire map tensor with zeros before it reaches the encoder. This:
-        #   - regularizes the model against over-reliance on map features (mitigates
-        #     posterior collapse onto the map embedding);
-        #   - jointly trains the with-map and zero-map regimes so a single checkpoint
-        #     degrades gracefully when no map is available at deployment time;
-        #   - smooths the orthomap-vs-no-map ablation (same model, different inputs).
-        # Gated on `self.training` so eval/inference is deterministic, and on `use_map`
-        # so the no-map config (use_map=False / map=None) is untouched. The zero-map
-        # path still runs through the use_map branch below — it does NOT switch to the
-        # else-branch — so the model learns to handle a zeroed map input, not the
-        # absence of the map-encoder pathway entirely.
+        # Map dropout: during training only, zero the whole map tensor with
+        # p=0.15. This regularizes against over-reliance on the map and lets a
+        # single checkpoint degrade gracefully when no map is available at
+        # deployment. The zeroed map still flows through the use_map branch
+        # below, so the model learns a blank map rather than a separate no-map
+        # code path. Disabled at eval and when the map encoder is off.
         if self.training and use_map and torch.rand(1).item() < 0.15:
             map = torch.zeros_like(map)
 
@@ -383,18 +371,22 @@ class ContextVAE(torch.nn.Module):
 
 
     def forward(self, *args, **kwargs):
-        # We put the training and testing forward function together in order to support 
-        #   DistributedDataParallel better.
-        # training:
-        #   x: L x N x 6
-        #   neighbor: L x N x Nn x 6, padding at Nn dimension using large value (e.g. 1e9)
-        #   output: args to self.loss()
-        # testing:
-        #   x: L x N x 6
-        #   neighbor: L x N x Nn x 6, padding at Nn dimension using large value (e.g. 1e9)
-        #   n_predictions: int, number of predictions
-        #   output: n_predictions x horizon x N x 2, for n_predictions > 0
-        #         horizon x N x 2, n_predictions=0 for deterministic prediction
+        # Training and inference share one forward() so DistributedDataParallel
+        # wraps the whole model cleanly. The mode follows self.training.
+        #
+        # Training inputs:
+        #   x        : L x N x 6
+        #   neighbor : L x N x Nn x 6, absent neighbors padded with 1e9 (see note below)
+        #   returns  : the (err, kl) args consumed by self.loss()
+        # Inference inputs:
+        #   x        : L x N x 6
+        #   neighbor : L x N x Nn x 6, same 1e9 padding
+        #   n_predictions : number of stochastic samples (0 = deterministic)
+        #   returns  : n_predictions x horizon x N x 2 if n_predictions > 0,
+        #              else horizon x N x 2 (posterior mean)
+        #
+        # The 1e9 pad is deliberate: enc() keeps neighbors with dist <= ob_radius,
+        # so a huge distance drops padded slots. Zero-padding would pass the mask.
 
         self.rnn_fx.flatten_parameters()
         self.rnn_fy.flatten_parameters()

@@ -1,12 +1,12 @@
-"""Compose qualitative thesis figures from existing replay frames.
+"""Compose qualitative figures from existing replay frames.
 
 Generates the following PNGs into ``--out-dir`` (default ``tmp/figs``):
 
-- ``qual_visdrone_pair.png``     — VisDrone aid5 stationary vs ego-motion (B3)
-- ``qual_failure_egomotion.png`` — synthetic stationary drift vs ego-motion fix (B5)
+- ``qual_visdrone_pair.png``     — VisDrone agent 5: stationary vs ego-motion
+- ``qual_failure_egomotion.png`` — synthetic stationary drift vs ego-motion fix
 
-B1 (multi-modality) is composed by ``compose_multimodal`` once
-``contextvae.visualize`` has written K=5 per-agent overlays.
+The multi-modality panel is composed by ``compose_multimodal`` once
+``contextvae.visualize`` has written the K=5 per-agent overlays.
 """
 
 import argparse
@@ -74,7 +74,7 @@ def compose_multimodal(viz_dir, out_dir, n_panels=4):
     if not cand:
         print(f"WARN: no PNGs found under {viz_dir}; skipping B1")
         return None
-    # Pick spread-out samples: take first, ~1/4, ~1/2, ~3/4 to vary scenes.
+    # Spread picks across the list (first, ~1/4, ~1/2, last) to vary scenes.
     n = len(cand)
     idx = [0, n // 4, n // 2, max(0, n - 1)] if n >= n_panels else list(range(n))
     picks = [cand[i] for i in idx[:n_panels]]

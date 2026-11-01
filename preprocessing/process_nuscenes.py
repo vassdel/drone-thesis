@@ -12,12 +12,15 @@ from nuscenes.utils.splits import create_splits_scenes
 from nuscenes.eval.prediction.splits import get_prediction_challenge_split
 from pyquaternion import Quaternion
 
-# conda create -n nuscenes
-# conda activate nuscenes
-# conda install python=3.9
-# pip install nuscenes-devkit==1.1.9
-# pip install pyquaternion==0.9.9
-# pip install pandas==1.3.4
+# nuScenes -> ContextVAE on-disk format. For each prediction-challenge case
+# writes <scene>/<token>.txt (rows: fid aid x y heading group) and .info
+# (first_frame map_name); one rasterized semantic map per location is written to
+# map/<location>.pkl as (semantic_map [3,H,W] in [-1,1], H 3x3).
+#
+# Environment:
+#   conda create -n nuscenes && conda activate nuscenes
+#   conda install python=3.9
+#   pip install nuscenes-devkit==1.1.9 pyquaternion==0.9.9 pandas==1.3.4
 
 import argparse
 parser = argparse.ArgumentParser()
@@ -28,14 +31,17 @@ parser.add_argument("--workers", type=int, default=None)
 settings = parser.parse_args()
 
 VERSION = "v1.0-trainval"
-MAP_SCALE = settings.map_scale # pixels of one meter
+MAP_SCALE = settings.map_scale  # raster pixels per meter
 DATA_ROOT = settings.data_root
 WORKERS = min(20, multiprocessing.cpu_count()//2) if settings.workers is None else settings.workers
 nuscenes = NuScenes(version=VERSION, dataroot=DATA_ROOT, verbose=False)
 
+# Rasterize a location's HD map over the agents' bounding box. Returns
+# (semantic_map [3,H,W] in [-1,1], H) with H mapping world (x, y) -> image (row, col).
 def get_semantic_map(map_name, x_min, x_max, y_min, y_max, map_scale):
     scene_map = NuScenesMap(dataroot=DATA_ROOT, map_name=map_name)
 
+    # Pad the extent by 300 m so agent-centered map crops stay in bounds at eval.
     x_min = x_min - 300
     x_max = x_max + 300
     y_min = y_min - 300
@@ -53,20 +59,27 @@ def get_semantic_map(map_name, x_min, x_max, y_min, y_max, map_scale):
     width = 1.*canvas_size[1]/map_scale
     patch_box = x_center, y_center, height, width
     mask = scene_map.get_map_mask(patch_box, 0., ["lane", "road_segment", "drivable_area", "road_divider", "lane_divider", "ped_crossing"], canvas_size)
+    # 3 channels: drivable area + crossings, road divider, lane divider.
     semantic_map = np.stack((np.max(mask[:3], axis=0)*0.75+mask[5]*0.25, mask[3], mask[4]))
-    semantic_map = (semantic_map*2-1).clip(-1, 1) # [0, 1] to [-1, 1]
+    semantic_map = (semantic_map*2-1).clip(-1, 1)  # [0, 1] -> [-1, 1]
 
+    # Homography: world (x, y) -> image (row, col); origin at the upper-left corner.
     H = np.array([
         [0., -map_scale, (y_center+0.5*height)*map_scale],
         [map_scale, 0., -(x_center-0.5*width)*map_scale],
         [0., 0., 1.]
-    ])  # left upper corner is the origin of image
-    semantic_map = semantic_map[:,::-1,:] # reverse rows, as nuscenes count rows from bottom to top.
-    
+    ])
+    # nuScenes counts rows bottom-to-top; flip rows to match image convention.
+    semantic_map = semantic_map[:,::-1,:]
+
     return semantic_map, H
 
+# Build per-case .txt / .info files for one scene, tracking the agents' world
+# bounding box so the caller can rasterize a tight map. Each case spans up to
+# 6 history + 12 future frames (2 s + 6 s at nuScenes' 2 Hz annotation rate).
 def generate(path, map_name, tokens):
 
+    # Track the world-space bounding box of all agents in this scene.
     x_max = -9999999
     y_max = -9999999
     x_min = 9999999
@@ -82,6 +95,7 @@ def generate(path, map_name, tokens):
         present = nuscenes.get("sample", sample_token)
         samples, sample = [], present
 
+        # Walk backward for history, stopping once 6 frames pass with no case token.
         hist = 0
         while sample["prev"] and hist < 6:
             sample = nuscenes.get("sample", sample["prev"])
@@ -94,6 +108,7 @@ def generate(path, map_name, tokens):
         samples = list(reversed(samples))
         samples.append(present)
         sample = present
+        # Walk forward for future, stopping once 12 frames pass with no case token.
         fut = 0
         while sample["next"] and fut < 12:
             sample = nuscenes.get("sample", sample["next"])
@@ -112,8 +127,9 @@ def generate(path, map_name, tokens):
             for ann_token in sample['anns']:
                 ann = nuscenes.get('sample_annotation', ann_token)
                 category = ann['category_name']
+                # Skip annotations with no attributes unless they are vehicles
+                # (drops static/background objects).
                 if not len(ann["attribute_tokens"]) and not "vehicle" in category:
-                    # ignore static objects
                     continue
                 if "cycle" in category:
                     agent_type = "CYCLE"
@@ -168,8 +184,11 @@ def generate(path, map_name, tokens):
 
         data = pd.DataFrame.from_dict(data, "index")
         data.sort_values('frame_id', inplace=True)
+        # Keep agents seen in more than one frame (need at least a velocity step).
         agents = [inst for inst in pd.unique(data["node_id"]) if len(records[inst]) > 1]
 
+        # One case per target agent: a 4-history + 12-future window around its
+        # prediction frame. The target's group is tagged "/CHALLENGE".
         for target_inst, val in interested.items():
             for target_fid, token in val:
                 content = []
@@ -235,6 +254,7 @@ if __name__ == "__main__":
             else:
                 M[m] = d
     print()
+    # Rasterize one map per location, sized to cover every agent seen there.
     print("Generating map...")
     for map_name, (x_min, x_max, y_min, y_max) in M.items():
         scene_map = NuScenesMap(dataroot=DATA_ROOT, map_name=map_name)
